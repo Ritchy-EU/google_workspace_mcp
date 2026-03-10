@@ -18,6 +18,15 @@ from auth.oauth_config import (
 
 # Server configuration
 WORKSPACE_MCP_PORT = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", 8000)))
+
+# Drive write restriction: comma-separated list of allowed shared drive IDs.
+# Empty = no restrictions (writes allowed everywhere).
+# When set, writes are only allowed to the listed shared drives.
+ALLOWED_WRITE_DRIVE_IDS = [
+    d.strip()
+    for d in os.getenv("ALLOWED_WRITE_DRIVE_IDS", "").split(",")
+    if d.strip()
+]
 WORKSPACE_MCP_BASE_URI = os.getenv("WORKSPACE_MCP_BASE_URI", "http://localhost")
 
 # Disable USER_GOOGLE_EMAIL in OAuth 2.1 multi-user mode

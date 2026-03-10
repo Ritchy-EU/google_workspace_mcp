@@ -373,3 +373,17 @@ async def resolve_folder_id(
             f"Resolved ID '{resolved_id}' (from '{folder_id}') is not a folder; mimeType={mime_type}."
         )
     return resolved_id
+
+
+async def get_file_drive_id(service, file_id: str) -> Optional[str]:
+    """
+    Get the shared drive ID that a file/folder belongs to.
+
+    Returns the driveId string for shared drive items, or None for My Drive items.
+    """
+    metadata = await asyncio.to_thread(
+        service.files()
+        .get(fileId=file_id, fields="driveId", supportsAllDrives=True)
+        .execute
+    )
+    return metadata.get("driveId")

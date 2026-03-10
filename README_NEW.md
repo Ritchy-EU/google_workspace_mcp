@@ -264,6 +264,7 @@ uvx workspace-mcp --tools gmail drive --tool-tier extended
 | `WORKSPACE_MCP_PORT` | Server port (default: `8000`) |
 | `WORKSPACE_EXTERNAL_URL` | External URL for reverse proxy setups |
 | `GOOGLE_MCP_CREDENTIALS_DIR` | Custom credentials storage path |
+| `ALLOWED_WRITE_DRIVE_IDS` | Comma-separated shared drive IDs to restrict writes to (empty = no restriction) |
 
 ---
 

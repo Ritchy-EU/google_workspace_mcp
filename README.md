@@ -170,6 +170,7 @@ uv run main.py --tools gmail drive
 | `MCP_ENABLE_OAUTH21` | Set to `true` for OAuth 2.1 support |
 | `EXTERNAL_OAUTH21_PROVIDER` | Set to `true` for external OAuth flow with bearer tokens (requires OAuth 2.1) |
 | `WORKSPACE_MCP_STATELESS_MODE` | Set to `true` for stateless operation (requires OAuth 2.1) |
+| `ALLOWED_WRITE_DRIVE_IDS` | Comma-separated shared drive IDs to restrict writes to |
 
 </td></tr>
 </table>
@@ -400,6 +401,7 @@ export USER_GOOGLE_EMAIL=\
 | `WORKSPACE_ATTACHMENT_DIR` | Directory for downloaded attachments | `~/.workspace-mcp/attachments/` |
 | `GOOGLE_OAUTH_REDIRECT_URI` | Override OAuth callback URL | Auto-constructed |
 | `USER_GOOGLE_EMAIL` | Default auth email | None |
+| `ALLOWED_WRITE_DRIVE_IDS` | Comma-separated shared drive IDs to restrict writes to. When set, all write operations (Drive, Docs, Sheets, Slides, Comments) are only allowed to files in the listed shared drives; My Drive and unlisted drives are blocked. Empty = no restriction. | None |
 
 </details>
 

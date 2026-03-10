@@ -23,6 +23,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from auth.service_decorator import require_google_service
+from auth.drive_restriction import restrict_to_drives
 from auth.oauth_config import is_stateless_mode
 from core.attachment_storage import get_attachment_storage, get_attachment_url
 from core.utils import extract_office_xml_text, handle_http_errors, validate_file_path
@@ -48,6 +49,120 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
 UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloads
+
+
+@server.tool()
+@handle_http_errors("list_shared_drives", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def list_shared_drives(
+    service,
+    user_google_email: str,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+) -> str:
+    """
+    Lists all shared drives accessible to the user.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        page_size (int): Maximum number of shared drives to return. Defaults to 100.
+        page_token (Optional[str]): Token for retrieving the next page of results.
+
+    Returns:
+        str: A formatted list of shared drives with their IDs, names, and creation dates.
+             Includes a nextPageToken line when more results are available.
+    """
+    logger.info(
+        f"[list_shared_drives] Invoked. Email: '{user_google_email}', Page Size: {page_size}"
+    )
+
+    params: Dict[str, Any] = {
+        "pageSize": page_size,
+        "fields": "nextPageToken, drives(id, name, createdTime, kind)",
+    }
+    if page_token:
+        params["pageToken"] = page_token
+
+    results = await asyncio.to_thread(service.drives().list(**params).execute)
+    drives = results.get("drives", [])
+
+    if not drives:
+        return "No shared drives found."
+
+    output_parts = [f"Found {len(drives)} shared drive(s):", ""]
+    for drive in drives:
+        drive_id = drive.get("id", "N/A")
+        name = drive.get("name", "Unknown")
+        created = drive.get("createdTime", "N/A")
+        output_parts.append(f"- {name}")
+        output_parts.append(f"  ID: {drive_id}")
+        output_parts.append(f"  Created: {created}")
+        output_parts.append("")
+
+    next_page_token = results.get("nextPageToken")
+    if next_page_token:
+        output_parts.append(f"nextPageToken: {next_page_token}")
+
+    return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("get_shared_drive", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def get_shared_drive(
+    service,
+    user_google_email: str,
+    drive_id: str,
+) -> str:
+    """
+    Gets detailed information about a specific shared drive.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        drive_id (str): The ID of the shared drive to retrieve.
+
+    Returns:
+        str: Detailed information about the shared drive including name, ID,
+             creation date, and restriction settings.
+    """
+    logger.info(
+        f"[get_shared_drive] Invoked. Email: '{user_google_email}', Drive ID: '{drive_id}'"
+    )
+
+    drive = await asyncio.to_thread(
+        service.drives()
+        .get(
+            driveId=drive_id,
+            fields="id, name, createdTime, restrictions, capabilities",
+        )
+        .execute
+    )
+
+    name = drive.get("name", "Unknown")
+    created = drive.get("createdTime", "N/A")
+    restrictions = drive.get("restrictions", {})
+    capabilities = drive.get("capabilities", {})
+
+    output_parts = [
+        f"Shared Drive: {name}",
+        f"ID: {drive.get('id', 'N/A')}",
+        f"Created: {created}",
+        "",
+    ]
+
+    if restrictions:
+        output_parts.append("Restrictions:")
+        for key, value in restrictions.items():
+            output_parts.append(f"  {key}: {value}")
+        output_parts.append("")
+
+    if capabilities:
+        output_parts.append("Capabilities:")
+        for key, value in capabilities.items():
+            output_parts.append(f"  {key}: {value}")
+        output_parts.append("")
+
+    return "\n".join(output_parts)
 
 
 @server.tool()
@@ -548,6 +663,7 @@ async def _create_drive_folder_impl(
 @server.tool()
 @handle_http_errors("create_drive_folder", service_type="drive")
 @require_google_service("drive", "drive_file")
+@restrict_to_drives(target_param="parent_folder_id")
 async def create_drive_folder(
     service,
     user_google_email: str,
@@ -577,6 +693,7 @@ async def create_drive_folder(
 @server.tool()
 @handle_http_errors("create_drive_file", service_type="drive")
 @require_google_service("drive", "drive_file")
+@restrict_to_drives(target_param="folder_id")
 async def create_drive_file(
     service,
     user_google_email: str,
@@ -1133,6 +1250,7 @@ def _detect_source_format(file_name: str, content: Optional[str] = None) -> str:
 @server.tool()
 @handle_http_errors("import_to_google_doc", service_type="drive")
 @require_google_service("drive", "drive_file")
+@restrict_to_drives(target_param="folder_id")
 async def import_to_google_doc(
     service,
     user_google_email: str,
@@ -1539,6 +1657,7 @@ async def check_drive_file_public_access(
 @server.tool()
 @handle_http_errors("update_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
+@restrict_to_drives(target_param="file_id")
 async def update_drive_file(
     service,
     user_google_email: str,
@@ -1776,6 +1895,7 @@ async def get_drive_shareable_link(
 @server.tool()
 @handle_http_errors("manage_drive_access", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
+@restrict_to_drives(target_param="file_id")
 async def manage_drive_access(
     service,
     user_google_email: str,
@@ -2143,6 +2263,7 @@ async def manage_drive_access(
 @server.tool()
 @handle_http_errors("copy_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
+@restrict_to_drives(target_param="parent_folder_id")
 async def copy_drive_file(
     service,
     user_google_email: str,
@@ -2217,6 +2338,7 @@ async def copy_drive_file(
     "set_drive_file_permissions", is_read_only=False, service_type="drive"
 )
 @require_google_service("drive", "drive_file")
+@restrict_to_drives(target_param="file_id")
 async def set_drive_file_permissions(
     service,
     user_google_email: str,
