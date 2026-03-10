@@ -10,6 +10,7 @@ import asyncio
 from typing import Optional
 
 from auth.service_decorator import require_google_service
+from auth.drive_restriction import restrict_to_drives
 from core.server import server
 from core.utils import handle_http_errors
 
@@ -76,6 +77,7 @@ def create_comment_tools(app_name: str, file_id_param: str):
 
         @require_google_service("drive", "drive_file")
         @handle_http_errors(manage_func_name, service_type="drive")
+        @restrict_to_drives(target_param="document_id")
         async def manage_comment(
             service,
             user_google_email: str,
@@ -107,6 +109,7 @@ def create_comment_tools(app_name: str, file_id_param: str):
 
         @require_google_service("drive", "drive_file")
         @handle_http_errors(manage_func_name, service_type="drive")
+        @restrict_to_drives(target_param="spreadsheet_id")
         async def manage_comment(
             service,
             user_google_email: str,
@@ -138,6 +141,7 @@ def create_comment_tools(app_name: str, file_id_param: str):
 
         @require_google_service("drive", "drive_file")
         @handle_http_errors(manage_func_name, service_type="drive")
+        @restrict_to_drives(target_param="presentation_id")
         async def manage_comment(
             service,
             user_google_email: str,

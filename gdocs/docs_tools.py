@@ -14,6 +14,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
+from auth.drive_restriction import restrict_to_drives
 from core.utils import extract_office_xml_text, handle_http_errors
 from core.server import server
 from core.comments import create_comment_tools
@@ -329,6 +330,7 @@ async def list_docs_in_folder(
 @server.tool()
 @handle_http_errors("create_doc", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives()
 async def create_doc(
     service: Any,
     user_google_email: str,
@@ -365,6 +367,7 @@ async def create_doc(
 @server.tool()
 @handle_http_errors("modify_doc_text", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def modify_doc_text(
     service: Any,
     user_google_email: str,
@@ -557,6 +560,7 @@ async def modify_doc_text(
 @server.tool()
 @handle_http_errors("find_and_replace_doc", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def find_and_replace_doc(
     service: Any,
     user_google_email: str,
@@ -608,6 +612,7 @@ async def find_and_replace_doc(
 @server.tool()
 @handle_http_errors("insert_doc_elements", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def insert_doc_elements(
     service: Any,
     user_google_email: str,
@@ -699,6 +704,7 @@ async def insert_doc_elements(
         },
     ]
 )
+@restrict_to_drives(target_param="document_id")
 async def insert_doc_image(
     docs_service: Any,
     drive_service: Any,
@@ -782,6 +788,7 @@ async def insert_doc_image(
 @server.tool()
 @handle_http_errors("update_doc_headers_footers", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def update_doc_headers_footers(
     service: Any,
     user_google_email: str,
@@ -839,6 +846,7 @@ async def update_doc_headers_footers(
 @server.tool()
 @handle_http_errors("batch_update_doc", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def batch_update_doc(
     service: Any,
     user_google_email: str,
@@ -1103,6 +1111,7 @@ async def inspect_doc_structure(
 @server.tool()
 @handle_http_errors("create_table_with_data", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def create_table_with_data(
     service: Any,
     user_google_email: str,
@@ -1290,6 +1299,7 @@ async def debug_table_structure(
 @server.tool()
 @handle_http_errors("export_doc_to_pdf", service_type="drive")
 @require_google_service("drive", "drive_file")
+@restrict_to_drives(target_param="document_id")
 async def export_doc_to_pdf(
     service: Any,
     user_google_email: str,
@@ -1445,6 +1455,7 @@ async def _get_paragraph_start_indices_in_range(
 @server.tool()
 @handle_http_errors("update_paragraph_style", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def update_paragraph_style(
     service: Any,
     user_google_email: str,
@@ -1767,6 +1778,7 @@ async def get_doc_as_markdown(
 @server.tool()
 @handle_http_errors("insert_doc_tab", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def insert_doc_tab(
     service: Any,
     user_google_email: str,
@@ -1816,6 +1828,7 @@ async def insert_doc_tab(
 @server.tool()
 @handle_http_errors("delete_doc_tab", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def delete_doc_tab(
     service: Any,
     user_google_email: str,
@@ -1849,6 +1862,7 @@ async def delete_doc_tab(
 @server.tool()
 @handle_http_errors("update_doc_tab", service_type="docs")
 @require_google_service("docs", "docs_write")
+@restrict_to_drives(target_param="document_id")
 async def update_doc_tab(
     service: Any,
     user_google_email: str,

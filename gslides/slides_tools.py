@@ -10,6 +10,7 @@ from typing import List, Dict, Any
 
 
 from auth.service_decorator import require_google_service
+from auth.drive_restriction import restrict_to_drives
 from core.server import server
 from core.utils import handle_http_errors
 from core.comments import create_comment_tools
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 @server.tool()
 @handle_http_errors("create_presentation", service_type="slides")
 @require_google_service("slides", "slides")
+@restrict_to_drives()
 async def create_presentation(
     service, user_google_email: str, title: str = "Untitled Presentation"
 ) -> str:
@@ -150,6 +152,7 @@ Slides Breakdown:
 @server.tool()
 @handle_http_errors("batch_update_presentation", service_type="slides")
 @require_google_service("slides", "slides")
+@restrict_to_drives(target_param="presentation_id")
 async def batch_update_presentation(
     service,
     user_google_email: str,

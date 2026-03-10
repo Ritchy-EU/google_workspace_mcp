@@ -11,6 +11,7 @@ import copy
 from typing import List, Optional, Union
 
 from auth.service_decorator import require_google_service
+from auth.drive_restriction import restrict_to_drives
 from core.server import server
 from core.utils import handle_http_errors, UserInputError
 from core.comments import create_comment_tools
@@ -283,6 +284,7 @@ async def read_sheet_values(
 @server.tool()
 @handle_http_errors("modify_sheet_values", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
+@restrict_to_drives(target_param="spreadsheet_id")
 async def modify_sheet_values(
     service,
     user_google_email: str,
@@ -652,6 +654,7 @@ async def _format_sheet_range_impl(
 @server.tool()
 @handle_http_errors("format_sheet_range", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
+@restrict_to_drives(target_param="spreadsheet_id")
 async def format_sheet_range(
     service,
     user_google_email: str,
@@ -731,6 +734,7 @@ async def format_sheet_range(
 @server.tool()
 @handle_http_errors("manage_conditional_formatting", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
+@restrict_to_drives(target_param="spreadsheet_id")
 async def manage_conditional_formatting(
     service,
     user_google_email: str,
@@ -1129,6 +1133,7 @@ async def manage_conditional_formatting(
 @server.tool()
 @handle_http_errors("create_spreadsheet", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
+@restrict_to_drives()
 async def create_spreadsheet(
     service,
     user_google_email: str,
@@ -1185,6 +1190,7 @@ async def create_spreadsheet(
 @server.tool()
 @handle_http_errors("create_sheet", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
+@restrict_to_drives(target_param="spreadsheet_id")
 async def create_sheet(
     service,
     user_google_email: str,
