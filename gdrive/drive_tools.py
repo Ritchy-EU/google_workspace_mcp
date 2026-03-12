@@ -734,7 +734,11 @@ async def create_drive_file(
         f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}"
     )
 
-    if content is None and fileUrl is None and mime_type != FOLDER_MIME_TYPE:
+    # Google-native MIME types that can be created without content (empty file)
+    GOOGLE_NATIVE_MIME_PREFIX = "application/vnd.google-apps."
+    is_google_native = mime_type.startswith(GOOGLE_NATIVE_MIME_PREFIX)
+
+    if content is None and fileUrl is None and not is_google_native:
         raise Exception("You must provide either 'content' or 'fileUrl'.")
 
     # Create folder (no content or media_body). Prefer create_drive_folder for new code.
@@ -933,6 +937,21 @@ async def create_drive_file(
             .create(
                 body=file_metadata,
                 media_body=MediaIoBaseUpload(media, mimetype=mime_type, resumable=True),
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
+    elif is_google_native:
+        # Google-native types (Docs, Sheets, Slides, etc.) can be created
+        # without content — the Drive API creates an empty native file.
+        logger.info(
+            f"[create_drive_file] Creating empty Google-native file with MIME type: {mime_type}"
+        )
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
                 fields="id, name, webViewLink",
                 supportsAllDrives=True,
             )
