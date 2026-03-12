@@ -27,6 +27,11 @@ async def create_presentation(
 ) -> str:
     """
     Create a new Google Slides presentation.
+    The presentation is created in the user's My Drive.
+
+    Note: To create a presentation inside a Shared Drive, use create_drive_file
+    with mime_type="application/vnd.google-apps.presentation" and the target folder_id,
+    then populate slides using batch_update_presentation with the returned file ID.
 
     Args:
         user_google_email (str): The user's Google email address. Required.

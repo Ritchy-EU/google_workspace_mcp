@@ -339,6 +339,12 @@ async def create_doc(
 ) -> str:
     """
     Creates a new Google Doc and optionally inserts initial content.
+    The document is created in the user's My Drive.
+
+    Note: To create a Google Doc inside a Shared Drive, use create_drive_file with
+    mime_type="application/vnd.google-apps.document" and the target folder_id,
+    then populate content using modify_doc_text or batch_update_doc with the
+    returned file ID.
 
     Returns:
         str: Confirmation message with document ID and link.

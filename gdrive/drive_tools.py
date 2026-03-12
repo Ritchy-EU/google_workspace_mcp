@@ -719,10 +719,27 @@ async def create_drive_file(
     Creates a new file in Google Drive, supporting creation within shared drives.
     Accepts either direct content or a fileUrl to fetch the content from.
 
+    You can also create empty Google-native files (Docs, Sheets, Slides, etc.) by
+    setting mime_type to the appropriate Google MIME type without providing content:
+      - Google Doc: mime_type="application/vnd.google-apps.document"
+      - Google Sheet: mime_type="application/vnd.google-apps.spreadsheet"
+      - Google Slides: mime_type="application/vnd.google-apps.presentation"
+
+    IMPORTANT — creating Google-native files with initial content on a Shared Drive:
+    The Drive API creates the file in the correct location but does NOT support
+    passing content for native Google types. Use this two-step workflow:
+      1. Call create_drive_file with the Google MIME type and folder_id (no content)
+         to create an empty file in the target Shared Drive folder.
+      2. Use the returned file ID with the appropriate API to populate content:
+         - Google Doc → use modify_doc_text or batch_update_doc
+         - Google Sheet → use modify_sheet_values
+         - Google Slides → use batch_update_presentation
+
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_name (str): The name for the new file.
         content (Optional[str]): If provided, the content to write to the file.
+            Ignored for Google-native MIME types (use the two-step workflow above).
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
         fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.

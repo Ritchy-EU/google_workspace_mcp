@@ -1142,6 +1142,11 @@ async def create_spreadsheet(
 ) -> str:
     """
     Creates a new Google Spreadsheet.
+    The spreadsheet is created in the user's My Drive.
+
+    Note: To create a Google Spreadsheet inside a Shared Drive, use create_drive_file
+    with mime_type="application/vnd.google-apps.spreadsheet" and the target folder_id,
+    then populate data using modify_sheet_values with the returned file ID.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
