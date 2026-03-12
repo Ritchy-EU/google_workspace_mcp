@@ -89,7 +89,16 @@ async def list_shared_drives(
     if not drives:
         return "No shared drives found."
 
+    from core.config import ALLOWED_WRITE_DRIVE_IDS
+
+    write_restricted = len(ALLOWED_WRITE_DRIVE_IDS) > 0
+
     output_parts = [f"Found {len(drives)} shared drive(s):", ""]
+    if write_restricted:
+        output_parts.append(
+            "Note: Write access is restricted. Only drives marked 'Write: YES' allow write operations."
+        )
+        output_parts.append("")
     for drive in drives:
         drive_id = drive.get("id", "N/A")
         name = drive.get("name", "Unknown")
@@ -97,6 +106,9 @@ async def list_shared_drives(
         output_parts.append(f"- {name}")
         output_parts.append(f"  ID: {drive_id}")
         output_parts.append(f"  Created: {created}")
+        if write_restricted:
+            writable = drive_id in ALLOWED_WRITE_DRIVE_IDS
+            output_parts.append(f"  Write: {'YES' if writable else 'NO'}")
         output_parts.append("")
 
     next_page_token = results.get("nextPageToken")
