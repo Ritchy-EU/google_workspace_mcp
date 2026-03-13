@@ -21,7 +21,8 @@ WORKSPACE_MCP_PORT = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", 8000)
 
 # Drive write restriction: comma-separated list of allowed shared drive IDs.
 # Empty = no restrictions (writes allowed everywhere).
-# When set, writes are only allowed to the listed shared drives.
+# When set, writes to unlisted shared drives are blocked.
+# My Drive is always allowed regardless of this setting.
 ALLOWED_WRITE_DRIVE_IDS = [
     d.strip()
     for d in os.getenv("ALLOWED_WRITE_DRIVE_IDS", "").split(",")

@@ -2,8 +2,9 @@
 Drive write restriction decorator.
 
 Restricts write operations to a configurable list of allowed shared drive IDs.
-When ALLOWED_WRITE_DRIVE_IDS is set, only writes to those drives are permitted.
-When empty/unset, no restrictions apply.
+When ALLOWED_WRITE_DRIVE_IDS is set, writes to unlisted *shared* drives are
+blocked. Writes to My Drive are always allowed regardless of this setting.
+When empty/unset, no restrictions apply at all.
 
 Works with any Google service type (Drive, Docs, Sheets, Slides).
 For non-Drive services, a temporary Drive service is built from the
@@ -63,15 +64,18 @@ def restrict_to_drives(target_param: Optional[str] = None):
     """
     Decorator that restricts write operations to allowed shared drives.
 
+    My Drive is always allowed — restrictions only apply to shared drives.
+    When ALLOWED_WRITE_DRIVE_IDS is set, writes to shared drives NOT in the
+    list are blocked. Writes to My Drive (root) pass through unconditionally.
+
     Must be placed BELOW @require_google_service so that the `service`
     parameter is available.
 
     Args:
         target_param: Name of the function parameter containing the
                       target file/folder ID to check (e.g. "file_id", "folder_id").
-                      If None, the operation is always blocked when restrictions
-                      are active (used for create operations that have no target ID
-                      and would create in My Drive).
+                      If None, the operation targets My Drive (e.g. create
+                      operations with no folder param) and is always allowed.
     """
 
     def decorator(func):
@@ -80,14 +84,9 @@ def restrict_to_drives(target_param: Optional[str] = None):
             if not ALLOWED_WRITE_DRIVE_IDS:
                 return await func(*args, **kwargs)
 
-            # No target_param means create-in-root operation — always block
+            # No target_param means create-in-root (My Drive) — always allowed
             if target_param is None:
-                raise ValueError(
-                    f"Write access denied: this operation creates items in My Drive, "
-                    f"which is not allowed when drive restrictions are active. "
-                    f"Use a drive-specific creation tool instead. "
-                    f"Allowed drive IDs: {ALLOWED_WRITE_DRIVE_IDS}"
-                )
+                return await func(*args, **kwargs)
 
             # service is always the first positional arg (injected by @require_google_service)
             service = args[0] if args else kwargs.get("service")
@@ -102,26 +101,23 @@ def restrict_to_drives(target_param: Optional[str] = None):
                     if idx < len(args):
                         target_id = args[idx]
 
+            # Target is My Drive root — always allowed
             if target_id is None or target_id == "root":
-                raise ValueError(
-                    f"Write access denied: target is in My Drive, not in an allowed shared drive. "
-                    f"Allowed drive IDs: {ALLOWED_WRITE_DRIVE_IDS}"
-                )
+                return await func(*args, **kwargs)
 
+            # Look up which drive this file/folder belongs to
             drive_id = await _get_drive_id_for_file(service, target_id)
 
+            # File is in My Drive (no driveId) — always allowed
             if drive_id is None:
-                raise ValueError(
-                    f"Write access denied: target '{target_id}' is in My Drive, "
-                    f"not in an allowed shared drive. "
-                    f"Allowed drive IDs: {ALLOWED_WRITE_DRIVE_IDS}"
-                )
+                return await func(*args, **kwargs)
 
+            # File is in a shared drive — check the allow-list
             if drive_id not in ALLOWED_WRITE_DRIVE_IDS:
                 raise ValueError(
-                    f"Write access denied: target '{target_id}' belongs to drive '{drive_id}' "
+                    f"Write access denied: target '{target_id}' belongs to shared drive '{drive_id}' "
                     f"which is not in the allowed list. "
-                    f"Allowed drive IDs: {ALLOWED_WRITE_DRIVE_IDS}"
+                    f"Allowed shared drive IDs: {ALLOWED_WRITE_DRIVE_IDS}"
                 )
 
             return await func(*args, **kwargs)
