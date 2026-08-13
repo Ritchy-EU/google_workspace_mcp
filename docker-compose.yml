@@ -2,15 +2,21 @@ services:
   gws_mcp:
     build: .
     container_name: gws_mcp
-    ports:
-      - "8000:8000"
+    restart: unless-stopped
     environment:
       - GOOGLE_MCP_CREDENTIALS_DIR=/app/store_creds
     volumes:
-      - ./client_secret.json:/app/client_secret.json:ro
       - store_creds:/app/store_creds:rw
     env_file:
       - .env
+    command: ["uv run main.py --transport streamable-http --permissions gmail:drafts drive:full calendar:full docs:full sheets:full slides:full forms:readonly tasks:full contacts:readonly chat:readonly search:readonly"]
+    networks:
+      - default
+      - n8n-docker_default
 
 volumes:
   store_creds:
+
+networks:
+  n8n-docker_default:
+    external: true
