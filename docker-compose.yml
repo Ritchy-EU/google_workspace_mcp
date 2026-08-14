@@ -13,6 +13,20 @@ services:
       - GOOGLE_OAUTH_REDIRECT_URI=${GOOGLE_OAUTH_REDIRECT_URI}
       - WORKSPACE_MCP_BASE_URI=${WORKSPACE_MCP_BASE_URI}
       - WORKSPACE_MCP_PERMISSIONS=${PERMISSIONS}
+      # OAuth 2.1: protocol-level auth, per-user identity bound to the session.
+      - MCP_ENABLE_OAUTH21=${MCP_ENABLE_OAUTH21}
+      # Public URL as the proxy serves it — unlike WORKSPACE_MCP_BASE_URI this is
+      # used verbatim (no port appended) for OAuth metadata and the consent page.
+      - WORKSPACE_EXTERNAL_URL=${WORKSPACE_EXTERNAL_URL}
+      # Persist OAuth proxy state; the Linux default (memory) drops every client
+      # registration on restart, forcing everyone to reconnect.
+      - WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=${WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND}
+      - WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY=${WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY}
+      # Stable key for storage encryption; without it the key is derived from the
+      # client secret and rotating that secret makes the stored state unreadable.
+      - FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY=${FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY}
+      # Restrict which redirect URIs dynamically registered clients may use.
+      - WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS=${WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS}
     volumes:
       - store_creds:/app/store_creds:rw
     networks:
