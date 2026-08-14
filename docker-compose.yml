@@ -4,6 +4,9 @@ services:
     container_name: gws_mcp
     restart: unless-stopped
     environment:
+      # Reachable from the reverse proxy / n8n over the docker network;
+      # since v1.21.1 upstream binds legacy streamable-http to 127.0.0.1 by default.
+      - WORKSPACE_MCP_HOST=0.0.0.0
       - GOOGLE_MCP_CREDENTIALS_DIR=/app/store_creds
       - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
       - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
