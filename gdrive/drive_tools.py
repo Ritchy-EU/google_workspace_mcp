@@ -7,35 +7,55 @@ This module provides MCP tools for interacting with Google Drive API.
 import asyncio
 import logging
 import io
-import httpx
 import base64
-import ipaddress
-import socket
-from contextlib import asynccontextmanager
+import binascii
 
-from typing import AsyncIterator, Optional, List, Dict, Any
-from tempfile import NamedTemporaryFile
-from urllib.parse import urljoin, urlparse, urlunparse
+from typing import Optional, List, Dict, Any
+from tempfile import NamedTemporaryFile, SpooledTemporaryFile
+from urllib.parse import urlparse
 from urllib.request import url2pathname
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
+from mcp.types import ToolAnnotations
+
 from auth.service_decorator import require_google_service
-from auth.drive_restriction import restrict_to_drives
 from auth.oauth_config import is_stateless_mode
 from core.attachment_storage import get_attachment_storage, get_attachment_url
-from core.utils import extract_office_xml_text, handle_http_errors, validate_file_path
+from core.utils import (
+    GOOGLE_API_WRITE_RETRIES,
+    IMAGE_MIME_TYPES,
+    encode_image_content,
+    extract_office_xml_text,
+    extract_pdf_text,
+    handle_http_errors,
+    validate_file_path,
+)
 from core.server import server
 from core.config import get_transport_mode
 from gdrive.drive_helpers import (
     DRIVE_QUERY_PATTERNS,
     FOLDER_MIME_TYPE,
+    GOOGLE_APPS_MIME_PREFIX,
+    GOOGLE_DOCS_IMPORT_FORMATS,
+    GOOGLE_DOCS_MIME_TYPE,
+    GOOGLE_SHEETS_IMPORT_FORMATS,
+    GOOGLE_SHEETS_MIME_TYPE,
+    GOOGLE_SLIDES_IMPORT_FORMATS,
+    GOOGLE_SLIDES_MIME_TYPE,
+    UPLOAD_CHUNK_SIZE_BYTES,
+    _resolve_import_media,
+    _stream_url_with_validation,
     build_drive_list_params,
     check_public_link_permission,
+    list_all_permissions,
+    derive_shared_state,
     format_permission_info,
     get_drive_image_url,
+    has_explicit_trashed_clause,
     resolve_drive_item,
     resolve_file_type_mime,
     resolve_folder_id,
@@ -46,138 +66,66 @@ from gdrive.drive_helpers import (
 
 logger = logging.getLogger(__name__)
 
-DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
-UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
-MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloads
+SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT = 10
+
+IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE = {
+    GOOGLE_DOCS_MIME_TYPE: GOOGLE_DOCS_IMPORT_FORMATS,
+    GOOGLE_SHEETS_MIME_TYPE: GOOGLE_SHEETS_IMPORT_FORMATS,
+    GOOGLE_SLIDES_MIME_TYPE: GOOGLE_SLIDES_IMPORT_FORMATS,
+}
+
+CONTENT_UPDATE_MODES = ("replace", "append", "prepend")
+_CONTENT_UPDATE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
 
-@server.tool()
-@handle_http_errors("list_shared_drives", is_read_only=True, service_type="drive")
-@require_google_service("drive", "drive_read")
-async def list_shared_drives(
-    service,
-    user_google_email: str,
-    page_size: int = 100,
-    page_token: Optional[str] = None,
-) -> str:
+def _get_content_update_lock(file_id: str) -> asyncio.Lock:
+    """Return a cached lock for updates within one event loop and process.
+
+    This does not coordinate updates across processes, replicas, or other Drive clients.
     """
-    Lists all shared drives accessible to the user.
+    lock = _CONTENT_UPDATE_LOCKS.get(file_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CONTENT_UPDATE_LOCKS[file_id] = lock
+    return lock
 
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        page_size (int): Maximum number of shared drives to return. Defaults to 100.
-        page_token (Optional[str]): Token for retrieving the next page of results.
 
-    Returns:
-        str: A formatted list of shared drives with their IDs, names, and creation dates.
-             Includes a nextPageToken line when more results are available.
-    """
-    logger.info(
-        f"[list_shared_drives] Invoked. Email: '{user_google_email}', Page Size: {page_size}"
+async def _download_file_bytes(
+    service, file_id: str, export_mime_type: Optional[str] = None
+) -> bytes:
+    """Download a Drive file's bytes, exporting native Google types when requested."""
+    request_obj = (
+        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+        if export_mime_type
+        else service.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
-
-    params: Dict[str, Any] = {
-        "pageSize": page_size,
-        "fields": "nextPageToken, drives(id, name, createdTime, kind)",
-    }
-    if page_token:
-        params["pageToken"] = page_token
-
-    results = await asyncio.to_thread(service.drives().list(**params).execute)
-    drives = results.get("drives", [])
-
-    if not drives:
-        return "No shared drives found."
-
-    from core.config import ALLOWED_WRITE_DRIVE_IDS
-
-    write_restricted = len(ALLOWED_WRITE_DRIVE_IDS) > 0
-
-    output_parts = [f"Found {len(drives)} shared drive(s):", ""]
-    if write_restricted:
-        output_parts.append(
-            "Note: Write access is restricted. Only drives marked 'Write: YES' allow write operations."
-        )
-        output_parts.append("")
-    for drive in drives:
-        drive_id = drive.get("id", "N/A")
-        name = drive.get("name", "Unknown")
-        created = drive.get("createdTime", "N/A")
-        output_parts.append(f"- {name}")
-        output_parts.append(f"  ID: {drive_id}")
-        output_parts.append(f"  Created: {created}")
-        if write_restricted:
-            writable = drive_id in ALLOWED_WRITE_DRIVE_IDS
-            output_parts.append(f"  Write: {'YES' if writable else 'NO'}")
-        output_parts.append("")
-
-    next_page_token = results.get("nextPageToken")
-    if next_page_token:
-        output_parts.append(f"nextPageToken: {next_page_token}")
-
-    return "\n".join(output_parts)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request_obj)
+    loop = asyncio.get_event_loop()
+    done = False
+    while not done:
+        _status, done = await loop.run_in_executor(None, downloader.next_chunk)
+    return fh.getvalue()
 
 
-@server.tool()
-@handle_http_errors("get_shared_drive", is_read_only=True, service_type="drive")
-@require_google_service("drive", "drive_read")
-async def get_shared_drive(
-    service,
-    user_google_email: str,
-    drive_id: str,
-) -> str:
-    """
-    Gets detailed information about a specific shared drive.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        drive_id (str): The ID of the shared drive to retrieve.
-
-    Returns:
-        str: Detailed information about the shared drive including name, ID,
-             creation date, and restriction settings.
-    """
-    logger.info(
-        f"[get_shared_drive] Invoked. Email: '{user_google_email}', Drive ID: '{drive_id}'"
+def _splice_content(existing: str, addition: str, mode: str) -> str:
+    """Join new text onto existing text, guaranteeing a newline at the seam."""
+    head, tail = (existing, addition) if mode == "append" else (addition, existing)
+    separator = (
+        "\n" if head and not head.endswith("\n") and not tail.startswith("\n") else ""
     )
-
-    drive = await asyncio.to_thread(
-        service.drives()
-        .get(
-            driveId=drive_id,
-            fields="id, name, createdTime, restrictions, capabilities",
-        )
-        .execute
-    )
-
-    name = drive.get("name", "Unknown")
-    created = drive.get("createdTime", "N/A")
-    restrictions = drive.get("restrictions", {})
-    capabilities = drive.get("capabilities", {})
-
-    output_parts = [
-        f"Shared Drive: {name}",
-        f"ID: {drive.get('id', 'N/A')}",
-        f"Created: {created}",
-        "",
-    ]
-
-    if restrictions:
-        output_parts.append("Restrictions:")
-        for key, value in restrictions.items():
-            output_parts.append(f"  {key}: {value}")
-        output_parts.append("")
-
-    if capabilities:
-        output_parts.append("Capabilities:")
-        for key, value in capabilities.items():
-            output_parts.append(f"  {key}: {value}")
-        output_parts.append("")
-
-    return "\n".join(output_parts)
+    return f"{head}{separator}{tail}"
 
 
-@server.tool()
+@server.tool(
+    title="Search Drive Files",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("search_drive_files", is_read_only=True, service_type="drive")
 @require_google_service("drive", "drive_read")
 async def search_drive_files(
@@ -191,6 +139,8 @@ async def search_drive_files(
     corpora: Optional[str] = None,
     file_type: Optional[str] = None,
     detailed: bool = True,
+    order_by: Optional[str] = None,
+    include_trashed: bool = False,
 ) -> str:
     """
     Searches for files and folders within a user's Google Drive, including shared drives.
@@ -198,6 +148,10 @@ async def search_drive_files(
     Args:
         user_google_email (str): The user's Google email address. Required.
         query (str): The search query string. Supports Google Drive search operators.
+                     NOTE: Owner-based queries ('user@example.com' in owners) DO NOT WORK in Shared Drives
+                     because files are owned by the shared drive itself, not individual users.
+                     For recent files by a specific user in Shared Drives, search by modifiedTime
+                     and use order_by='modifiedTime desc' instead.
         page_size (int): The maximum number of files to return. Defaults to 10.
         page_token (Optional[str]): Page token from a previous response's nextPageToken to retrieve the next page of results.
         drive_id (Optional[str]): ID of the shared drive to search. If None, behavior depends on `corpora` and `include_items_from_all_drives`.
@@ -211,13 +165,22 @@ async def search_drive_files(
                                    'script', 'site', 'jam'/'jamboard') or any raw MIME type
                                    string (e.g. 'application/pdf'). Defaults to None (all types).
         detailed (bool): Whether to include size, modified time, and link in results. Defaults to True.
+        order_by (Optional[str]): Sort order. Comma-separated list of sort keys with optional 'desc' modifier.
+                                  Valid keys: 'createdTime', 'folder', 'modifiedByMeTime', 'modifiedTime',
+                                  'name', 'name_natural', 'quotaBytesUsed', 'recency', 'sharedWithMeTime',
+                                  'starred', 'viewedByMeTime'. Example: 'modifiedTime desc' or 'folder,modifiedTime desc,name'.
+                                  Defaults to None (Drive API default ordering).
+        include_trashed (bool): Whether to include files in the trash. Defaults to False, matching
+                                the Drive web UI and `list_drive_items`. Ignored when `query` already
+                                contains its own `trashed` clause (`=` or `!=`), which always wins.
 
     Returns:
         str: A formatted list of found files/folders with their details (ID, name, type, and optionally size, modified time, link).
              Includes a nextPageToken line when more results are available.
     """
     logger.info(
-        f"[search_drive_files] Invoked. Email: '{user_google_email}', Query: '{query}', file_type: '{file_type}'"
+        f"[search_drive_files] Invoked. Email: '{user_google_email}', Query: '{query}', "
+        f"file_type: '{file_type}', include_trashed: {include_trashed}"
     )
 
     # Check if the query looks like a structured Drive query or free text
@@ -237,6 +200,15 @@ async def search_drive_files(
             f"[search_drive_files] Reformatting free text query '{query}' to '{final_query}'"
         )
 
+    # Drive's files.list returns trashed items unless told otherwise. Hide them by
+    # default so search agrees with list_drive_items and the Drive web UI, but never
+    # override an explicit trashed clause the caller wrote themselves.
+    if not include_trashed and not has_explicit_trashed_clause(final_query):
+        final_query = f"({final_query}) and trashed=false"
+        logger.info(
+            "[search_drive_files] Excluding trashed items (include_trashed=False)"
+        )
+
     if file_type is not None:
         mime = resolve_file_type_mime(file_type)
         final_query = f"({final_query}) and mimeType = '{mime}'"
@@ -250,6 +222,8 @@ async def search_drive_files(
         corpora=corpora,
         page_token=page_token,
         detailed=detailed,
+        include_permissions=detailed,
+        order_by=order_by,
     )
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
@@ -263,8 +237,42 @@ async def search_drive_files(
     for item in files:
         if detailed:
             size_str = f", Size: {item.get('size', 'N/A')}" if "size" in item else ""
+            created_str = (
+                f", Created: {item['createdTime']}" if item.get("createdTime") else ""
+            )
+            # Last modifying user (not available for all files)
+            lmu = item.get("lastModifyingUser")
+            if lmu:
+                lmu_name = lmu.get("displayName", "")
+                lmu_email = lmu.get("emailAddress", "")
+                if lmu_name and lmu_email:
+                    last_edited_by_str = f", Last Edited By: {lmu_name} <{lmu_email}>"
+                elif lmu_name:
+                    last_edited_by_str = f", Last Edited By: {lmu_name}"
+                elif lmu_email:
+                    last_edited_by_str = f", Last Edited By: {lmu_email}"
+                else:
+                    last_edited_by_str = ""
+            else:
+                last_edited_by_str = ""
+            # Anyone-with-link permission role (reader/commenter/writer)
+            anyone_role_str = ""
+            for perm in item.get("permissions", []):
+                if perm.get("type") == "anyone":
+                    anyone_role_str = (
+                        f", Anyone with link: {perm.get('role', 'unknown')}"
+                    )
+                    break
+            # TODO: "Created By" (original file creator) is not included here.
+            # For Shared Drive files the `owners` field is always empty — the drive
+            # owns the file.  True creator attribution requires fetching revision 1
+            # via files/{id}/revisions and reading its lastModifyingUser.  That adds
+            # one API call per file and should be a separate follow-up.
             formatted_files_text_parts.append(
-                f'- Name: "{item["name"]}" (ID: {item["id"]}, Type: {item["mimeType"]}{size_str}, Modified: {item.get("modifiedTime", "N/A")}) Link: {item.get("webViewLink", "#")}'
+                f'- Name: "{item["name"]}" (ID: {item["id"]}, Type: {item["mimeType"]}{size_str}'
+                f"{created_str}, Modified: {item.get('modifiedTime', 'N/A')}"
+                f"{last_edited_by_str}{anyone_role_str})"
+                f" Link: {item.get('webViewLink', '#')}"
             )
         else:
             formatted_files_text_parts.append(
@@ -276,7 +284,15 @@ async def search_drive_files(
     return text_output
 
 
-@server.tool()
+@server.tool(
+    title="Get Drive File Content",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_drive_file_content", is_read_only=True, service_type="drive")
 @require_google_service("drive", "drive_read")
 async def get_drive_file_content(
@@ -290,6 +306,9 @@ async def get_drive_file_content(
     • Native Google Docs, Sheets, Slides → exported as text / CSV.
     • Office files (.docx, .xlsx, .pptx) → unzipped & parsed with std-lib to
       extract readable text.
+    • PDFs → text extracted with pypdf when possible; scanned/image-only PDFs
+      fall back to a download hint.
+    • Images → returned as base64 with MIME metadata for multimodal clients.
     • Any other file → downloaded; tries UTF-8 decode, else notes binary.
 
     Args:
@@ -315,19 +334,7 @@ async def get_drive_file_content(
         "application/vnd.google-apps.presentation": "text/plain",
     }.get(mime_type)
 
-    request_obj = (
-        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-        if export_mime_type
-        else service.files().get_media(fileId=file_id)
-    )
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request_obj)
-    loop = asyncio.get_event_loop()
-    done = False
-    while not done:
-        status, done = await loop.run_in_executor(None, downloader.next_chunk)
-
-    file_content_bytes = fh.getvalue()
+    file_content_bytes = await _download_file_bytes(service, file_id, export_mime_type)
 
     # Attempt Office XML extraction only for actual Office XML files
     office_mime_types = {
@@ -337,7 +344,10 @@ async def get_drive_file_content(
     }
 
     if mime_type in office_mime_types:
-        office_text = extract_office_xml_text(file_content_bytes, mime_type)
+        # Offload Office XML extraction to a thread to avoid blocking the event loop
+        office_text = await asyncio.to_thread(
+            extract_office_xml_text, file_content_bytes, mime_type
+        )
         if office_text:
             body_text = office_text
         else:
@@ -349,6 +359,19 @@ async def get_drive_file_content(
                     f"[Binary or unsupported text encoding for mimeType '{mime_type}' - "
                     f"{len(file_content_bytes)} bytes]"
                 )
+    elif mime_type == "application/pdf":
+        # Offload PDF text extraction to a thread to avoid blocking the event loop
+        pdf_text = await asyncio.to_thread(extract_pdf_text, file_content_bytes)
+        if pdf_text:
+            body_text = pdf_text
+        else:
+            body_text = (
+                f"[Could not extract text from PDF ({len(file_content_bytes)} bytes) "
+                f"- the file may be scanned/image-only. "
+                f"Use get_drive_file_download_url to get a direct download link instead.]"
+            )
+    elif mime_type in IMAGE_MIME_TYPES:
+        body_text = encode_image_content(file_content_bytes, mime_type)
     else:
         # For non-Office files (including Google native files), try UTF-8 decode directly
         try:
@@ -367,7 +390,15 @@ async def get_drive_file_content(
     return header + body_text
 
 
-@server.tool()
+@server.tool(
+    title="Get Drive File Download URL",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors(
     "get_drive_file_download_url", is_read_only=True, service_type="drive"
 )
@@ -471,20 +502,7 @@ async def get_drive_file_download_url(
                 output_filename = f"{Path(output_filename).stem}.pdf"
 
     # Download the file
-    request_obj = (
-        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-        if export_mime_type
-        else service.files().get_media(fileId=file_id)
-    )
-
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request_obj)
-    loop = asyncio.get_event_loop()
-    done = False
-    while not done:
-        status, done = await loop.run_in_executor(None, downloader.next_chunk)
-
-    file_content_bytes = fh.getvalue()
+    file_content_bytes = await _download_file_bytes(service, file_id, export_mime_type)
     size_bytes = len(file_content_bytes)
     size_kb = size_bytes / 1024 if size_bytes else 0
 
@@ -556,7 +574,15 @@ async def get_drive_file_download_url(
         )
 
 
-@server.tool()
+@server.tool(
+    title="List Drive Items",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("list_drive_items", is_read_only=True, service_type="drive")
 @require_google_service("drive", "drive_read")
 async def list_drive_items(
@@ -570,11 +596,16 @@ async def list_drive_items(
     corpora: Optional[str] = None,
     file_type: Optional[str] = None,
     detailed: bool = True,
+    order_by: Optional[str] = None,
+    resource_type: str = "items",
+    query: Optional[str] = None,
+    include_organizers: bool = False,
 ) -> str:
     """
-    Lists files and folders, supporting shared drives.
+    Lists files/folders or shared drive containers, supporting shared drives.
     If `drive_id` is specified, lists items within that shared drive. `folder_id` is then relative to that drive (or use drive_id as folder_id for root).
     If `drive_id` is not specified, lists items from user's "My Drive" and accessible shared drives (if `include_items_from_all_drives` is True).
+    Set `resource_type` to "shared_drives" to list shared drive containers instead of folder contents.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -590,14 +621,40 @@ async def list_drive_items(
                                    'script', 'site', 'jam'/'jamboard') or any raw MIME type
                                    string (e.g. 'application/pdf'). Defaults to None (all types).
         detailed (bool): Whether to include size, modified time, and link in results. Defaults to True.
+        order_by (Optional[str]): Sort order. Comma-separated list of sort keys with optional 'desc' modifier.
+                                  Valid keys: 'createdTime', 'folder', 'modifiedByMeTime', 'modifiedTime',
+                                  'name', 'name_natural', 'quotaBytesUsed', 'recency', 'sharedWithMeTime',
+                                  'starred', 'viewedByMeTime'. Example: 'modifiedTime desc' or 'folder,modifiedTime desc,name'.
+                                  Defaults to None (Drive API default ordering).
+        resource_type (str): What to list. Use "items" for folder contents or
+                             "shared_drives" for shared drive containers. Defaults to "items".
+        query (Optional[str]): Shared drive query used only when resource_type="shared_drives",
+                               e.g. "name contains 'Engineering'".
+        include_organizers (bool): When resource_type="shared_drives", include principals
+                                   with the organizer role. This costs one extra permissions.list
+                                   API call per shared drive returned. Defaults to False.
 
     Returns:
-        str: A formatted list of files/folders in the specified folder.
+        str: A formatted list of files/folders in the specified folder or shared drives.
              Includes a nextPageToken line when more results are available.
     """
     logger.info(
-        f"[list_drive_items] Invoked. Email: '{user_google_email}', Folder ID: '{folder_id}', File Type: '{file_type}'"
+        f"[list_drive_items] Invoked. Email: '{user_google_email}', Folder ID: '{folder_id}', "
+        f"File Type: '{file_type}', Resource Type: '{resource_type}'"
     )
+
+    normalized_resource_type = resource_type.lower().strip()
+    if normalized_resource_type == "shared_drives":
+        return await _list_shared_drives_impl(
+            service=service,
+            user_google_email=user_google_email,
+            page_size=page_size,
+            page_token=page_token,
+            query=query,
+            include_organizers=include_organizers,
+        )
+    if normalized_resource_type != "items":
+        raise ValueError("resource_type must be either 'items' or 'shared_drives'")
 
     resolved_folder_id = await resolve_folder_id(service, folder_id)
     final_query = f"'{resolved_folder_id}' in parents and trashed=false"
@@ -615,6 +672,7 @@ async def list_drive_items(
         corpora=corpora,
         page_token=page_token,
         detailed=detailed,
+        order_by=order_by,
     )
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
@@ -630,8 +688,31 @@ async def list_drive_items(
     for item in files:
         if detailed:
             size_str = f", Size: {item.get('size', 'N/A')}" if "size" in item else ""
+            drive_id_str = (
+                f", Drive ID: {item['driveId']}" if item.get("driveId") else ""
+            )
+            created_str = (
+                f", Created: {item['createdTime']}" if item.get("createdTime") else ""
+            )
+            lmu = item.get("lastModifyingUser")
+            if lmu:
+                lmu_name = lmu.get("displayName", "")
+                lmu_email = lmu.get("emailAddress", "")
+                if lmu_name and lmu_email:
+                    last_edited_by_str = f", Last Edited By: {lmu_name} <{lmu_email}>"
+                elif lmu_name:
+                    last_edited_by_str = f", Last Edited By: {lmu_name}"
+                elif lmu_email:
+                    last_edited_by_str = f", Last Edited By: {lmu_email}"
+                else:
+                    last_edited_by_str = ""
+            else:
+                last_edited_by_str = ""
             formatted_items_text_parts.append(
-                f'- Name: "{item["name"]}" (ID: {item["id"]}, Type: {item["mimeType"]}{size_str}, Modified: {item.get("modifiedTime", "N/A")}) Link: {item.get("webViewLink", "#")}'
+                f'- Name: "{item["name"]}" (ID: {item["id"]}, Type: {item["mimeType"]}{size_str}'
+                f"{created_str}, Modified: {item.get('modifiedTime', 'N/A')}"
+                f"{last_edited_by_str}{drive_id_str})"
+                f" Link: {item.get('webViewLink', '#')}"
             )
         else:
             formatted_items_text_parts.append(
@@ -641,6 +722,129 @@ async def list_drive_items(
         formatted_items_text_parts.append(f"nextPageToken: {next_token}")
     text_output = "\n".join(formatted_items_text_parts)
     return text_output
+
+
+async def _list_shared_drives_impl(
+    service,
+    user_google_email: str,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+    query: Optional[str] = None,
+    include_organizers: bool = False,
+) -> str:
+    """List shared drives available to the authenticated user."""
+    logger.info(
+        f"[list_shared_drives] Invoked. Email: '{user_google_email}', page_size: {page_size}, "
+        f"include_organizers: {include_organizers}"
+    )
+
+    list_params: Dict[str, Any] = {
+        "pageSize": min(max(page_size, 1), 100),
+        "fields": (
+            "drives(id, name, createdTime, hidden, "
+            "restrictions, capabilities(canManageMembers, canEdit)), "
+            "nextPageToken"
+        ),
+    }
+    if page_token:
+        list_params["pageToken"] = page_token
+    if query:
+        list_params["q"] = query
+
+    results = await asyncio.to_thread(service.drives().list(**list_params).execute)
+    drives = results.get("drives", [])
+    if not drives:
+        return f"No shared drives found for {user_google_email}."
+
+    if include_organizers:
+
+        async def _fetch_organizers(d: Dict[str, Any]) -> None:
+            try:
+                permissions = []
+                next_permission_page_token = None
+
+                while True:
+                    list_kwargs: Dict[str, Any] = {
+                        "fileId": d["id"],
+                        "supportsAllDrives": True,
+                        "useDomainAdminAccess": False,
+                        "fields": (
+                            "nextPageToken, "
+                            "permissions(emailAddress, displayName, role, type, domain)"
+                        ),
+                        "pageSize": 100,
+                    }
+                    if next_permission_page_token:
+                        list_kwargs["pageToken"] = next_permission_page_token
+
+                    perms = await asyncio.to_thread(
+                        service.permissions().list(**list_kwargs).execute
+                    )
+                    permissions.extend(perms.get("permissions", []))
+
+                    next_permission_page_token = perms.get("nextPageToken")
+                    if not next_permission_page_token:
+                        break
+
+                d["_organizers"] = [
+                    p for p in permissions if p.get("role") == "organizer"
+                ]
+            except HttpError as e:
+                status = getattr(e, "status_code", None)
+                if status is None and getattr(e, "resp", None) is not None:
+                    status = getattr(e.resp, "status", None)
+                reason = getattr(e, "reason", None) or str(e)
+                d["_organizers_error"] = f"{status or 'unknown'}: {reason}"
+
+        organizer_fetch_sem = asyncio.Semaphore(
+            SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT
+        )
+
+        async def _bounded_fetch_organizers(d: Dict[str, Any]) -> None:
+            async with organizer_fetch_sem:
+                await _fetch_organizers(d)
+
+        await asyncio.gather(*[_bounded_fetch_organizers(d) for d in drives])
+
+    next_token = results.get("nextPageToken")
+    parts = [f"Found {len(drives)} shared drives for {user_google_email}:"]
+    for d in drives:
+        caps = d.get("capabilities") or {}
+        rest = d.get("restrictions") or {}
+        cap_flags = ", ".join(k for k, v in caps.items() if v) or "none"
+        rest_flags = ", ".join(k for k, v in rest.items() if v) or "none"
+        hidden = " [hidden]" if d.get("hidden") else ""
+        parts.append(
+            f'- Name: "{d["name"]}" (ID: {d["id"]}, Created: {d.get("createdTime", "N/A")}){hidden} '
+            f"Capabilities: {cap_flags}; Restrictions: {rest_flags}"
+        )
+        if include_organizers:
+            err = d.get("_organizers_error")
+            if err:
+                parts.append(f"  Organizers: <error: {err}>")
+            else:
+                organizers = d.get("_organizers", [])
+                if not organizers:
+                    parts.append("  Organizers: <none returned>")
+                else:
+                    for o in organizers:
+                        identifier = (
+                            o.get("emailAddress")
+                            or o.get("domain")
+                            or o.get("displayName")
+                            or o.get("type", "?")
+                        )
+                        display = o.get("displayName")
+                        kind = o.get("type", "?")
+                        suffix = (
+                            f' ("{display}")'
+                            if display and display != identifier
+                            else ""
+                        )
+                        parts.append(f"  Organizer ({kind}): {identifier}{suffix}")
+    if next_token:
+        parts.append(f"nextPageToken: {next_token}")
+    return "\n".join(parts)
 
 
 async def _create_drive_folder_impl(
@@ -672,10 +876,17 @@ async def _create_drive_folder_impl(
     )
 
 
-@server.tool()
+@server.tool(
+    title="Create Drive Folder",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("create_drive_folder", service_type="drive")
 @require_google_service("drive", "drive_file")
-@restrict_to_drives(target_param="parent_folder_id")
 async def create_drive_folder(
     service,
     user_google_email: str,
@@ -702,10 +913,17 @@ async def create_drive_folder(
     )
 
 
-@server.tool()
+@server.tool(
+    title="Create Drive File",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("create_drive_file", service_type="drive")
 @require_google_service("drive", "drive_file")
-@restrict_to_drives(target_param="folder_id")
 async def create_drive_file(
     service,
     user_google_email: str,
@@ -714,35 +932,25 @@ async def create_drive_file(
     folder_id: str = "root",
     mime_type: str = "text/plain",
     fileUrl: Optional[str] = None,  # Now explicitly Optional
+    base64_content: Optional[str] = None,
+    content_mime_type: Optional[str] = None,
 ) -> str:
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
-    Accepts either direct content or a fileUrl to fetch the content from.
-
-    You can also create empty Google-native files (Docs, Sheets, Slides, etc.) by
-    setting mime_type to the appropriate Google MIME type without providing content:
-      - Google Doc: mime_type="application/vnd.google-apps.document"
-      - Google Sheet: mime_type="application/vnd.google-apps.spreadsheet"
-      - Google Slides: mime_type="application/vnd.google-apps.presentation"
-
-    IMPORTANT — creating Google-native files with initial content on a Shared Drive:
-    The Drive API creates the file in the correct location but does NOT support
-    passing content for native Google types. Use this two-step workflow:
-      1. Call create_drive_file with the Google MIME type and folder_id (no content)
-         to create an empty file in the target Shared Drive folder.
-      2. Use the returned file ID with the appropriate API to populate content:
-         - Google Doc → use modify_doc_text or batch_update_doc
-         - Google Sheet → use modify_sheet_values
-         - Google Slides → use batch_update_presentation
+    Accepts direct text content, inline base64 bytes, or a fileUrl to fetch content from.
+    Google-native files (mime_type "application/vnd.google-apps.document" /
+    ".spreadsheet" / ".presentation") are created empty: omit content, fileUrl and
+    base64_content, then populate the returned file ID with the Docs/Sheets/Slides tools.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_name (str): The name for the new file.
         content (Optional[str]): If provided, the content to write to the file.
-            Ignored for Google-native MIME types (use the two-step workflow above).
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
         fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
+        base64_content (Optional[str]): Standard base64-encoded file bytes.
+        content_mime_type (Optional[str]): MIME type for base64_content uploads.
 
     Returns:
         str: Confirmation message of the successful file creation with file link.
@@ -751,12 +959,31 @@ async def create_drive_file(
         f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}"
     )
 
-    # Google-native MIME types that can be created without content (empty file)
-    GOOGLE_NATIVE_MIME_PREFIX = "application/vnd.google-apps."
-    is_google_native = mime_type.startswith(GOOGLE_NATIVE_MIME_PREFIX)
+    has_existing_content_source = content is not None or bool(fileUrl)
+    # Google-native types (Docs, Sheets, Slides, folders, ...) may be created
+    # empty; Drive does not accept media uploads for these MIME types.
+    is_google_native = mime_type.startswith("application/vnd.google-apps.")
+    if (
+        not has_existing_content_source
+        and base64_content is None
+        and not is_google_native
+    ):
+        raise ValueError(
+            "You must provide one of 'content', 'fileUrl', or 'base64_content'."
+        )
+    if base64_content is not None and has_existing_content_source:
+        raise ValueError("'base64_content' cannot be used with 'content' or 'fileUrl'.")
+    if content_mime_type is not None and base64_content is None:
+        raise ValueError("'content_mime_type' can only be used with 'base64_content'.")
+    if base64_content is not None and not content_mime_type:
+        raise ValueError("'content_mime_type' is required when using 'base64_content'.")
 
-    if content is None and fileUrl is None and not is_google_native:
-        raise Exception("You must provide either 'content' or 'fileUrl'.")
+    file_data = None
+    if base64_content is not None:
+        try:
+            file_data = base64.b64decode(base64_content, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("'base64_content' must be valid standard base64.") from exc
 
     # Create folder (no content or media_body). Prefer create_drive_folder for new code.
     if mime_type == FOLDER_MIME_TYPE:
@@ -764,7 +991,6 @@ async def create_drive_file(
             service, user_google_email, file_name, folder_id
         )
 
-    file_data = None
     resolved_folder_id = await resolve_folder_id(service, folder_id)
 
     file_metadata = {
@@ -773,8 +999,28 @@ async def create_drive_file(
         "mimeType": mime_type,
     }
 
-    # Prefer fileUrl if both are provided
-    if fileUrl:
+    if base64_content is not None:
+        file_metadata["mimeType"] = content_mime_type
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_data),
+            mimetype=content_mime_type,
+            resumable=True,
+            chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+        )
+
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
+        )
+    # Prefer fileUrl if both legacy sources are provided.
+    elif fileUrl:
         logger.info(f"[create_drive_file] Fetching file from URL: {fileUrl}")
 
         # Check if this is a file:// URL
@@ -838,68 +1084,59 @@ async def create_drive_file(
                     fields="id, name, webViewLink",
                     supportsAllDrives=True,
                 )
-                .execute
+                .execute,
+                num_retries=GOOGLE_API_WRITE_RETRIES,
             )
         # Handle HTTP/HTTPS URLs
         elif parsed_url.scheme in ("http", "https"):
             # when running in stateless mode, deployment may not have access to local file system
             if is_stateless_mode():
-                resp = await _ssrf_safe_fetch(fileUrl)
-                if resp.status_code != 200:
-                    raise Exception(
-                        f"Failed to fetch file from URL: {fileUrl} (status {resp.status_code})"
+                with SpooledTemporaryFile(max_size=UPLOAD_CHUNK_SIZE_BYTES) as spool:
+
+                    async def _write_spool(chunk: bytes) -> None:
+                        await asyncio.to_thread(spool.write, chunk)
+
+                    _total, content_type = await _stream_url_with_validation(
+                        fileUrl, _write_spool
                     )
-                file_data = resp.content
-                # Try to get MIME type from Content-Type header
-                content_type = resp.headers.get("Content-Type")
-                if content_type and content_type != "application/octet-stream":
-                    mime_type = content_type
-                    file_metadata["mimeType"] = content_type
-                    logger.info(
-                        f"[create_drive_file] Using MIME type from Content-Type header: {content_type}"
+                    await asyncio.to_thread(spool.seek, 0)
+
+                    # Try to get MIME type from Content-Type header
+                    if content_type and content_type != "application/octet-stream":
+                        mime_type = content_type
+                        file_metadata["mimeType"] = content_type
+                        logger.info(
+                            f"[create_drive_file] Using MIME type from Content-Type header: {content_type}"
+                        )
+
+                    media = MediaIoBaseUpload(
+                        spool,
+                        mimetype=mime_type,
+                        resumable=True,
+                        chunksize=UPLOAD_CHUNK_SIZE_BYTES,
                     )
 
-                media = MediaIoBaseUpload(
-                    io.BytesIO(file_data),
-                    mimetype=mime_type,
-                    resumable=True,
-                    chunksize=UPLOAD_CHUNK_SIZE_BYTES,
-                )
-
-                created_file = await asyncio.to_thread(
-                    service.files()
-                    .create(
-                        body=file_metadata,
-                        media_body=media,
-                        fields="id, name, webViewLink",
-                        supportsAllDrives=True,
+                    created_file = await asyncio.to_thread(
+                        service.files()
+                        .create(
+                            body=file_metadata,
+                            media_body=media,
+                            fields="id, name, webViewLink",
+                            supportsAllDrives=True,
+                        )
+                        .execute,
+                        num_retries=GOOGLE_API_WRITE_RETRIES,
                     )
-                    .execute
-                )
             else:
                 # Stream download to temp file with SSRF protection, then upload
                 with NamedTemporaryFile() as temp_file:
-                    total_bytes = 0
-                    content_type = None
 
-                    async with _ssrf_safe_stream(fileUrl) as resp:
-                        if resp.status_code != 200:
-                            raise Exception(
-                                f"Failed to fetch file from URL: {fileUrl} "
-                                f"(status {resp.status_code})"
-                            )
+                    async def _write_chunk(chunk: bytes) -> None:
+                        await asyncio.to_thread(temp_file.write, chunk)
 
-                        content_type = resp.headers.get("Content-Type")
-
-                        async for chunk in resp.aiter_bytes(
-                            chunk_size=DOWNLOAD_CHUNK_SIZE_BYTES
-                        ):
-                            total_bytes += len(chunk)
-                            if total_bytes > MAX_DOWNLOAD_BYTES:
-                                raise Exception(
-                                    f"Download exceeded {MAX_DOWNLOAD_BYTES} byte limit"
-                                )
-                            await asyncio.to_thread(temp_file.write, chunk)
+                    total_bytes, content_type = await _stream_url_with_validation(
+                        fileUrl, _write_chunk
+                    )
 
                     logger.info(
                         f"[create_drive_file] Downloaded {total_bytes} bytes "
@@ -935,7 +1172,8 @@ async def create_drive_file(
                             fields="id, name, webViewLink",
                             supportsAllDrives=True,
                         )
-                        .execute
+                        .execute,
+                        num_retries=GOOGLE_API_WRITE_RETRIES,
                     )
         else:
             if not parsed_url.scheme:
@@ -957,11 +1195,12 @@ async def create_drive_file(
                 fields="id, name, webViewLink",
                 supportsAllDrives=True,
             )
-            .execute
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
         )
+
     elif is_google_native:
-        # Google-native types (Docs, Sheets, Slides, etc.) can be created
-        # without content — the Drive API creates an empty native file.
+        # No content source: create an empty Google-native file (metadata only).
         logger.info(
             f"[create_drive_file] Creating empty Google-native file with MIME type: {mime_type}"
         )
@@ -972,7 +1211,8 @@ async def create_drive_file(
                 fields="id, name, webViewLink",
                 supportsAllDrives=True,
             )
-            .execute
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
         )
 
     link = created_file.get("webViewLink", "No link available")
@@ -981,324 +1221,118 @@ async def create_drive_file(
     return confirmation_message
 
 
-# Mapping of file extensions to source MIME types for Google Docs conversion
-GOOGLE_DOCS_IMPORT_FORMATS = {
-    ".md": "text/markdown",
-    ".markdown": "text/markdown",
-    ".txt": "text/plain",
-    ".text": "text/plain",
-    ".html": "text/html",
-    ".htm": "text/html",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".doc": "application/msword",
-    ".rtf": "application/rtf",
-    ".odt": "application/vnd.oasis.opendocument.text",
-}
-
-GOOGLE_DOCS_MIME_TYPE = "application/vnd.google-apps.document"
-
-
-def _resolve_and_validate_host(hostname: str) -> list[str]:
+async def _import_with_conversion(
+    service,
+    *,
+    tool_name: str,
+    target_label: str,
+    id_label: str,
+    target_mime_type: str,
+    format_map: Dict[str, str],
+    user_google_email: str,
+    file_name: str,
+    content: Optional[str],
+    file_path: Optional[str],
+    file_url: Optional[str],
+    source_format: Optional[str],
+    folder_id: str,
+) -> str:
     """
-    Resolve a hostname to IP addresses and validate none are private/internal.
+    Shared implementation for the import_to_google_* tools.
 
-    Uses getaddrinfo to handle both IPv4 and IPv6. Fails closed on DNS errors.
-
-    Returns:
-        list[str]: Validated resolved IP address strings.
-
-    Raises:
-        ValueError: If hostname resolves to private/internal IPs or DNS fails.
-    """
-    if not hostname:
-        raise ValueError("Invalid URL: no hostname")
-
-    # Block localhost variants
-    if hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-        raise ValueError("URLs pointing to localhost are not allowed")
-
-    # Resolve hostname using getaddrinfo (handles both IPv4 and IPv6)
-    try:
-        addr_infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror as e:
-        raise ValueError(
-            f"Cannot resolve hostname '{hostname}': {e}. "
-            "Refusing request (fail-closed)."
-        )
-
-    if not addr_infos:
-        raise ValueError(f"No addresses found for hostname: {hostname}")
-
-    resolved_ips: list[str] = []
-    seen_ips: set[str] = set()
-    for _family, _type, _proto, _canonname, sockaddr in addr_infos:
-        ip_str = sockaddr[0]
-        ip = ipaddress.ip_address(ip_str)
-        if not ip.is_global:
-            raise ValueError(
-                f"URLs pointing to private/internal networks are not allowed: "
-                f"{hostname} resolves to {ip_str}"
-            )
-        if ip_str not in seen_ips:
-            seen_ips.add(ip_str)
-            resolved_ips.append(ip_str)
-
-    return resolved_ips
-
-
-def _validate_url_not_internal(url: str) -> list[str]:
-    """
-    Validate that a URL doesn't point to internal/private networks (SSRF protection).
-
-    Returns:
-        list[str]: Validated resolved IP addresses for the hostname.
-
-    Raises:
-        ValueError: If URL points to localhost or private IP ranges.
-    """
-    parsed = urlparse(url)
-    return _resolve_and_validate_host(parsed.hostname)
-
-
-def _format_host_header(hostname: str, scheme: str, port: Optional[int]) -> str:
-    """Format the Host header value for IPv4/IPv6 hostnames."""
-    host_value = hostname
-    if ":" in host_value and not host_value.startswith("["):
-        host_value = f"[{host_value}]"
-
-    is_default_port = (scheme == "http" and (port is None or port == 80)) or (
-        scheme == "https" and (port is None or port == 443)
-    )
-    if not is_default_port and port is not None:
-        host_value = f"{host_value}:{port}"
-    return host_value
-
-
-def _build_pinned_url(parsed_url, ip_address_str: str) -> str:
-    """Build a URL that targets a resolved IP while preserving path/query."""
-    pinned_host = ip_address_str
-    if ":" in pinned_host and not pinned_host.startswith("["):
-        pinned_host = f"[{pinned_host}]"
-
-    userinfo = ""
-    if parsed_url.username is not None:
-        userinfo = parsed_url.username
-        if parsed_url.password is not None:
-            userinfo += f":{parsed_url.password}"
-        userinfo += "@"
-
-    port_part = f":{parsed_url.port}" if parsed_url.port is not None else ""
-    netloc = f"{userinfo}{pinned_host}{port_part}"
-
-    path = parsed_url.path or "/"
-    return urlunparse(
-        (
-            parsed_url.scheme,
-            netloc,
-            path,
-            parsed_url.params,
-            parsed_url.query,
-            parsed_url.fragment,
-        )
-    )
-
-
-async def _fetch_url_with_pinned_ip(url: str) -> httpx.Response:
-    """
-    Fetch URL content by connecting to a validated, pre-resolved IP address.
-
-    This prevents DNS rebinding between validation and the outbound connection.
-    """
-    parsed_url = urlparse(url)
-    if parsed_url.scheme not in ("http", "https"):
-        raise ValueError(f"Only http:// and https:// are supported: {url}")
-    if not parsed_url.hostname:
-        raise ValueError(f"Invalid URL: missing hostname ({url})")
-
-    resolved_ips = _validate_url_not_internal(url)
-    host_header = _format_host_header(
-        parsed_url.hostname, parsed_url.scheme, parsed_url.port
-    )
-
-    last_error: Optional[Exception] = None
-    for resolved_ip in resolved_ips:
-        pinned_url = _build_pinned_url(parsed_url, resolved_ip)
-        try:
-            async with httpx.AsyncClient(
-                follow_redirects=False, trust_env=False
-            ) as client:
-                request = client.build_request(
-                    "GET",
-                    pinned_url,
-                    headers={"Host": host_header},
-                    extensions={"sni_hostname": parsed_url.hostname},
-                )
-                return await client.send(request)
-        except httpx.HTTPError as exc:
-            last_error = exc
-            logger.warning(
-                f"[ssrf_safe_fetch] Failed request via resolved IP {resolved_ip} for host "
-                f"{parsed_url.hostname}: {exc}"
-            )
-
-    raise Exception(
-        f"Failed to fetch URL after trying {len(resolved_ips)} validated IP(s): {url}"
-    ) from last_error
-
-
-async def _ssrf_safe_fetch(url: str, *, stream: bool = False) -> httpx.Response:
-    """
-    Fetch a URL with SSRF protection that covers redirects and DNS rebinding.
-
-    Validates the initial URL and every redirect target against private/internal
-    networks. Disables automatic redirect following and handles redirects manually.
+    Uploads source bytes (from content, a local file, or a remote URL) as media
+    while ``body.mimeType`` is the Google Apps ``target_mime_type``, letting Drive
+    auto-convert the Office/OpenDocument/text source into native Google format.
 
     Args:
-        url: The URL to fetch.
-        stream: If True, returns a streaming response (caller must manage context).
-
-    Returns:
-        httpx.Response with the final response content.
-
-    Raises:
-        ValueError: If any URL in the redirect chain points to a private network.
-        Exception: If the HTTP request fails.
+        tool_name: Logging prefix and the tool's registered name (for messages).
+        target_label: Human-readable destination name (e.g. "Google Doc").
+        id_label: Label for the created file's ID in the confirmation message.
+        target_mime_type: The ``application/vnd.google-apps.*`` destination type.
+        format_map: Extension -> source MIME type allowlist for this destination.
     """
-    if stream:
-        raise ValueError("Streaming mode is not supported by _ssrf_safe_fetch.")
+    logger.info(
+        f"[{tool_name}] Invoked. Email: '{user_google_email}', "
+        f"File Name: '{file_name}', Source Format: '{source_format}', Folder ID: '{folder_id}'"
+    )
 
-    max_redirects = 10
-    current_url = url
+    media, source_mime_type, remote_file_data = await _resolve_import_media(
+        tool_name=tool_name,
+        file_name=file_name,
+        content=content,
+        file_path=file_path,
+        file_url=file_url,
+        source_format=source_format,
+        format_map=format_map,
+    )
 
-    for _ in range(max_redirects):
-        resp = await _fetch_url_with_pinned_ip(current_url)
+    # Clean up file name (remove extension since it becomes a Google Apps file)
+    doc_name = Path(file_name).stem if Path(file_name).suffix else file_name
 
-        if resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("location")
-            if not location:
-                raise Exception(f"Redirect with no Location header from {current_url}")
+    # Resolve folder
+    resolved_folder_id = await resolve_folder_id(service, folder_id)
 
-            # Resolve relative redirects against the current URL
-            location = urljoin(current_url, location)
+    # File metadata - destination is the Google Apps target format
+    file_metadata = {
+        "name": doc_name,
+        "parents": [resolved_folder_id],
+        "mimeType": target_mime_type,  # Target format = Google Apps type
+    }
 
-            redirect_parsed = urlparse(location)
-            if redirect_parsed.scheme not in ("http", "https"):
-                raise ValueError(
-                    f"Redirect to disallowed scheme: {redirect_parsed.scheme}"
-                )
+    # Upload with conversion
+    logger.info(
+        f"[{tool_name}] Uploading to Google Drive with conversion: "
+        f"{source_mime_type} → {target_mime_type}"
+    )
+    try:
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink, mimeType",
+                supportsAllDrives=True,
+            )
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
+        )
+    finally:
+        if remote_file_data is not None:
+            remote_file_data.close()
 
-            current_url = location
-            continue
+    result_mime = created_file.get("mimeType", "unknown")
+    if result_mime != target_mime_type:
+        logger.warning(
+            f"[{tool_name}] Conversion may have failed. "
+            f"Expected {target_mime_type}, got {result_mime}"
+        )
 
-        return resp
+    link = created_file.get("webViewLink", "No link available")
+    doc_id = created_file.get("id", "N/A")
 
-    raise Exception(f"Too many redirects (max {max_redirects}) fetching {url}")
+    confirmation = (
+        f"✅ Successfully imported '{doc_name}' as {target_label}\n"
+        f"   {id_label}: {doc_id}\n"
+        f"   Source format: {source_mime_type}\n"
+        f"   Folder: {folder_id}\n"
+        f"   Link: {link}"
+    )
 
-
-@asynccontextmanager
-async def _ssrf_safe_stream(url: str) -> AsyncIterator[httpx.Response]:
-    """
-    SSRF-safe streaming fetch: validates each redirect target against private
-    networks, then streams the final response body without buffering it all
-    in memory.
-
-    Usage::
-
-        async with _ssrf_safe_stream(file_url) as resp:
-            async for chunk in resp.aiter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE_BYTES):
-                ...
-    """
-    max_redirects = 10
-    current_url = url
-
-    # Resolve redirects manually so every hop is SSRF-validated
-    for _ in range(max_redirects):
-        parsed = urlparse(current_url)
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError(f"Only http:// and https:// are supported: {current_url}")
-        if not parsed.hostname:
-            raise ValueError(f"Invalid URL: missing hostname ({current_url})")
-
-        resolved_ips = _validate_url_not_internal(current_url)
-        host_header = _format_host_header(parsed.hostname, parsed.scheme, parsed.port)
-
-        last_error: Optional[Exception] = None
-        resp: Optional[httpx.Response] = None
-        for resolved_ip in resolved_ips:
-            pinned_url = _build_pinned_url(parsed, resolved_ip)
-            client = httpx.AsyncClient(follow_redirects=False, trust_env=False)
-            try:
-                request = client.build_request(
-                    "GET",
-                    pinned_url,
-                    headers={"Host": host_header},
-                    extensions={"sni_hostname": parsed.hostname},
-                )
-                resp = await client.send(request, stream=True)
-                break
-            except httpx.HTTPError as exc:
-                last_error = exc
-                await client.aclose()
-                logger.warning(
-                    f"[ssrf_safe_stream] Failed via IP {resolved_ip} for "
-                    f"{parsed.hostname}: {exc}"
-                )
-            except Exception:
-                await client.aclose()
-                raise
-
-        if resp is None:
-            raise Exception(
-                f"Failed to fetch URL after trying {len(resolved_ips)} validated IP(s): "
-                f"{current_url}"
-            ) from last_error
-
-        if resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("location")
-            await resp.aclose()
-            await client.aclose()
-            if not location:
-                raise Exception(f"Redirect with no Location header from {current_url}")
-            location = urljoin(current_url, location)
-            redirect_parsed = urlparse(location)
-            if redirect_parsed.scheme not in ("http", "https"):
-                raise ValueError(
-                    f"Redirect to disallowed scheme: {redirect_parsed.scheme}"
-                )
-            current_url = location
-            continue
-
-        # Non-redirect — yield the streaming response
-        try:
-            yield resp
-        finally:
-            await resp.aclose()
-            await client.aclose()
-        return
-
-    raise Exception(f"Too many redirects (max {max_redirects}) fetching {url}")
+    logger.info(f"[{tool_name}] Success. Link: {link}")
+    return confirmation
 
 
-def _detect_source_format(file_name: str, content: Optional[str] = None) -> str:
-    """
-    Detect the source MIME type based on file extension.
-    Falls back to text/plain if unknown.
-    """
-    ext = Path(file_name).suffix.lower()
-    if ext in GOOGLE_DOCS_IMPORT_FORMATS:
-        return GOOGLE_DOCS_IMPORT_FORMATS[ext]
-
-    # If content is provided and looks like markdown, use markdown
-    if content and (content.startswith("#") or "```" in content or "**" in content):
-        return "text/markdown"
-
-    return "text/plain"
-
-
-@server.tool()
+@server.tool(
+    title="Import to Google Doc",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("import_to_google_doc", service_type="drive")
 @require_google_service("drive", "drive_file")
-@restrict_to_drives(target_param="folder_id")
 async def import_to_google_doc(
     service,
     user_google_email: str,
@@ -1314,12 +1348,14 @@ async def import_to_google_doc(
 
     Google Drive automatically converts the source file to native Google Docs format,
     preserving formatting like headings, lists, bold, italic, etc.
+    For batch operations, prefer file_path for files on disk so callers do not need
+    to load full file contents into their context.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_name (str): The name for the new Google Doc (extension will be ignored).
-        content (Optional[str]): Text content for text-based formats (MD, TXT, HTML).
-        file_path (Optional[str]): Local file path for binary formats (DOCX, ODT). Supports file:// URLs.
+        content (Optional[str]): Text content for text-based formats. Use only for short snippets or content already in memory.
+        file_path (Optional[str]): Local file path or file:// URL for any supported format (MD, TXT, HTML, DOCX, ODT, RTF). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
         file_url (Optional[str]): Remote URL to fetch the file from (http/https).
         source_format (Optional[str]): Source format hint ('md', 'markdown', 'docx', 'txt', 'html', 'rtf', 'odt').
                                        Auto-detected from file_name extension if not provided.
@@ -1329,6 +1365,9 @@ async def import_to_google_doc(
         str: Confirmation message with the new Google Doc link.
 
     Examples:
+        # Import a markdown file from disk (preferred for batch operations)
+        import_to_google_doc(file_name="My Doc.md", file_path="/path/to/my-doc.md", source_format="md")
+
         # Import markdown content directly
         import_to_google_doc(file_name="My Doc.md", content="# Title\\n\\nHello **world**")
 
@@ -1338,165 +1377,165 @@ async def import_to_google_doc(
         # Import from URL
         import_to_google_doc(file_name="Remote Doc", file_url="https://example.com/doc.md")
     """
-    logger.info(
-        f"[import_to_google_doc] Invoked. Email: '{user_google_email}', "
-        f"File Name: '{file_name}', Source Format: '{source_format}', Folder ID: '{folder_id}'"
+    return await _import_with_conversion(
+        service,
+        tool_name="import_to_google_doc",
+        target_label="Google Doc",
+        id_label="Document ID",
+        target_mime_type=GOOGLE_DOCS_MIME_TYPE,
+        format_map=GOOGLE_DOCS_IMPORT_FORMATS,
+        user_google_email=user_google_email,
+        file_name=file_name,
+        content=content,
+        file_path=file_path,
+        file_url=file_url,
+        source_format=source_format,
+        folder_id=folder_id,
     )
 
-    # Validate inputs
-    source_count = sum(1 for x in [content, file_path, file_url] if x is not None)
-    if source_count == 0:
-        raise ValueError(
-            "You must provide one of: 'content', 'file_path', or 'file_url'."
-        )
-    if source_count > 1:
-        raise ValueError("Provide only one of: 'content', 'file_path', or 'file_url'.")
 
-    # Determine source MIME type
-    if source_format:
-        # Normalize format hint
-        format_key = f".{source_format.lower().lstrip('.')}"
-        if format_key in GOOGLE_DOCS_IMPORT_FORMATS:
-            source_mime_type = GOOGLE_DOCS_IMPORT_FORMATS[format_key]
-        else:
-            raise ValueError(
-                f"Unsupported source_format: '{source_format}'. "
-                f"Supported: {', '.join(ext.lstrip('.') for ext in GOOGLE_DOCS_IMPORT_FORMATS.keys())}"
-            )
-    else:
-        # Auto-detect from file_name, file_path, or file_url
-        detection_name = file_path or file_url or file_name
-        source_mime_type = _detect_source_format(detection_name, content)
+@server.tool(
+    title="Import to Google Slides",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("import_to_google_slides", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def import_to_google_slides(
+    service,
+    user_google_email: str,
+    file_name: str,
+    file_path: Optional[str] = None,
+    file_url: Optional[str] = None,
+    source_format: Optional[str] = None,
+    folder_id: str = "root",
+) -> str:
+    """
+    Imports a presentation (PPTX, PPT, ODP) into Google Slides format with automatic conversion.
 
-    logger.info(f"[import_to_google_doc] Detected source MIME type: {source_mime_type}")
+    Google Drive automatically converts the source presentation to native Google Slides format,
+    preserving slides, layouts, text, and images.
+    For batch operations, prefer file_path for files on disk so callers do not need
+    to load full file contents into their context.
 
-    # Clean up file name (remove extension since it becomes a Google Doc)
-    doc_name = Path(file_name).stem if Path(file_name).suffix else file_name
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_name (str): The name for the new Google Slides presentation (extension will be ignored).
+        file_path (Optional[str]): Local file path or file:// URL for any supported format (PPTX, PPT, ODP). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
+        file_url (Optional[str]): Remote URL to fetch the presentation from (http/https).
+        source_format (Optional[str]): Source format hint ('pptx', 'ppt', 'odp').
+                                       Auto-detected from file_name extension if not provided.
+        folder_id (str): The ID of the parent folder. Defaults to 'root'.
 
-    # Resolve folder
-    resolved_folder_id = await resolve_folder_id(service, folder_id)
+    Returns:
+        str: Confirmation message with the new Google Slides link.
 
-    # File metadata - destination is Google Docs format
-    file_metadata = {
-        "name": doc_name,
-        "parents": [resolved_folder_id],
-        "mimeType": GOOGLE_DOCS_MIME_TYPE,  # Target format = Google Docs
-    }
+    Examples:
+        # Import a local PowerPoint file (preferred for batch operations)
+        import_to_google_slides(file_name="Deck", file_path="/path/to/deck.pptx")
 
-    file_data: bytes
-
-    # Handle content (string input for text formats)
-    if content is not None:
-        file_data = content.encode("utf-8")
-        logger.info(f"[import_to_google_doc] Using content: {len(file_data)} bytes")
-
-    # Handle file_path (local file)
-    elif file_path is not None:
-        parsed_url = urlparse(file_path)
-
-        # Handle file:// URL format
-        if parsed_url.scheme == "file":
-            raw_path = parsed_url.path or ""
-            netloc = parsed_url.netloc
-            if netloc and netloc.lower() != "localhost":
-                raw_path = f"//{netloc}{raw_path}"
-            actual_path = url2pathname(raw_path)
-        elif parsed_url.scheme == "":
-            # Regular path
-            actual_path = file_path
-        else:
-            raise ValueError(
-                f"file_path should be a local path or file:// URL, got: {file_path}"
-            )
-
-        path_obj = validate_file_path(actual_path)
-        if not path_obj.exists():
-            raise FileNotFoundError(f"File not found: {actual_path}")
-        if not path_obj.is_file():
-            raise ValueError(f"Path is not a file: {actual_path}")
-
-        file_data = await asyncio.to_thread(path_obj.read_bytes)
-        logger.info(f"[import_to_google_doc] Read local file: {len(file_data)} bytes")
-
-        # Re-detect format from actual file if not specified
-        if not source_format:
-            source_mime_type = _detect_source_format(actual_path)
-            logger.info(
-                f"[import_to_google_doc] Re-detected from path: {source_mime_type}"
-            )
-
-    # Handle file_url (remote file)
-    elif file_url is not None:
-        parsed_url = urlparse(file_url)
-        if parsed_url.scheme not in ("http", "https"):
-            raise ValueError(f"file_url must be http:// or https://, got: {file_url}")
-
-        # SSRF protection: block internal/private network URLs and validate redirects
-        resp = await _ssrf_safe_fetch(file_url)
-        if resp.status_code != 200:
-            raise Exception(
-                f"Failed to fetch file from URL: {file_url} (status {resp.status_code})"
-            )
-        file_data = resp.content
-
-        logger.info(
-            f"[import_to_google_doc] Downloaded from URL: {len(file_data)} bytes"
-        )
-
-        # Re-detect format from URL if not specified
-        if not source_format:
-            source_mime_type = _detect_source_format(file_url)
-            logger.info(
-                f"[import_to_google_doc] Re-detected from URL: {source_mime_type}"
-            )
-
-    # Upload with conversion
-    media = MediaIoBaseUpload(
-        io.BytesIO(file_data),
-        mimetype=source_mime_type,  # Source format
-        resumable=True,
-        chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+        # Import from URL
+        import_to_google_slides(file_name="Remote Deck", file_url="https://example.com/deck.pptx")
+    """
+    return await _import_with_conversion(
+        service,
+        tool_name="import_to_google_slides",
+        target_label="Google Slides presentation",
+        id_label="Presentation ID",
+        target_mime_type=GOOGLE_SLIDES_MIME_TYPE,
+        format_map=GOOGLE_SLIDES_IMPORT_FORMATS,
+        user_google_email=user_google_email,
+        file_name=file_name,
+        content=None,
+        file_path=file_path,
+        file_url=file_url,
+        source_format=source_format,
+        folder_id=folder_id,
     )
 
-    logger.info(
-        f"[import_to_google_doc] Uploading to Google Drive with conversion: "
-        f"{source_mime_type} → {GOOGLE_DOCS_MIME_TYPE}"
+
+@server.tool(
+    title="Import to Google Sheets",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("import_to_google_sheets", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def import_to_google_sheets(
+    service,
+    user_google_email: str,
+    file_name: str,
+    content: Optional[str] = None,
+    file_path: Optional[str] = None,
+    file_url: Optional[str] = None,
+    source_format: Optional[str] = None,
+    folder_id: str = "root",
+) -> str:
+    """
+    Imports a spreadsheet (XLSX, XLS, ODS, CSV, TSV) into Google Sheets format with automatic conversion.
+
+    Google Drive automatically converts the source spreadsheet to native Google Sheets format,
+    preserving rows, columns, sheets, and values.
+    For batch operations, prefer file_path for files on disk so callers do not need
+    to load full file contents into their context.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_name (str): The name for the new Google Sheets spreadsheet (extension will be ignored).
+        content (Optional[str]): Text content for text-based formats (CSV, TSV). Use only for short snippets or content already in memory.
+        file_path (Optional[str]): Local file path or file:// URL for any supported format (XLSX, XLS, ODS, CSV, TSV). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
+        file_url (Optional[str]): Remote URL to fetch the spreadsheet from (http/https).
+        source_format (Optional[str]): Source format hint ('xlsx', 'xls', 'ods', 'csv', 'tsv').
+                                       Auto-detected from file_name extension if not provided.
+        folder_id (str): The ID of the parent folder. Defaults to 'root'.
+
+    Returns:
+        str: Confirmation message with the new Google Sheets link.
+
+    Examples:
+        # Import a local Excel file (preferred for batch operations)
+        import_to_google_sheets(file_name="Budget", file_path="/path/to/budget.xlsx")
+
+        # Import CSV content directly
+        import_to_google_sheets(file_name="Data.csv", content="a,b,c\\n1,2,3", source_format="csv")
+
+        # Import from URL
+        import_to_google_sheets(file_name="Remote Sheet", file_url="https://example.com/data.xlsx")
+    """
+    return await _import_with_conversion(
+        service,
+        tool_name="import_to_google_sheets",
+        target_label="Google Sheets spreadsheet",
+        id_label="Spreadsheet ID",
+        target_mime_type=GOOGLE_SHEETS_MIME_TYPE,
+        format_map=GOOGLE_SHEETS_IMPORT_FORMATS,
+        user_google_email=user_google_email,
+        file_name=file_name,
+        content=content,
+        file_path=file_path,
+        file_url=file_url,
+        source_format=source_format,
+        folder_id=folder_id,
     )
 
-    created_file = await asyncio.to_thread(
-        service.files()
-        .create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, name, webViewLink, mimeType",
-            supportsAllDrives=True,
-        )
-        .execute
-    )
 
-    result_mime = created_file.get("mimeType", "unknown")
-    if result_mime != GOOGLE_DOCS_MIME_TYPE:
-        logger.warning(
-            f"[import_to_google_doc] Conversion may have failed. "
-            f"Expected {GOOGLE_DOCS_MIME_TYPE}, got {result_mime}"
-        )
-
-    link = created_file.get("webViewLink", "No link available")
-    doc_id = created_file.get("id", "N/A")
-
-    confirmation = (
-        f"✅ Successfully imported '{doc_name}' as Google Doc\n"
-        f"   Document ID: {doc_id}\n"
-        f"   Source format: {source_mime_type}\n"
-        f"   Folder: {folder_id}\n"
-        f"   Link: {link}"
-    )
-
-    logger.info(f"[import_to_google_doc] Success. Link: {link}")
-    return confirmation
-
-
-@server.tool()
+@server.tool(
+    title="Get Drive File Permissions",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors(
     "get_drive_file_permissions", is_read_only=True, service_type="drive"
 )
@@ -1507,14 +1546,15 @@ async def get_drive_file_permissions(
     file_id: str,
 ) -> str:
     """
-    Gets detailed metadata about a Google Drive file including sharing permissions.
+    Gets detailed metadata about a Google Drive file including sharing permissions,
+    parent folder IDs, ownership, and lifecycle timestamps.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_id (str): The ID of the file to check permissions for.
 
     Returns:
-        str: Detailed file metadata including sharing status and URLs.
+        str: Detailed file metadata including parents, owners, timestamps, sharing status, and URLs.
     """
     logger.info(
         f"[get_drive_file_permissions] Checking file {file_id} for {user_google_email}"
@@ -1529,7 +1569,8 @@ async def get_drive_file_permissions(
             service.files()
             .get(
                 fileId=file_id,
-                fields="id, name, mimeType, size, modifiedTime, owners, "
+                fields="id, name, mimeType, size, parents, createdTime, modifiedTime, "
+                "trashed, driveId, owners(displayName,emailAddress), "
                 "permissions(id, type, role, emailAddress, domain, expirationTime, permissionDetails), "
                 "webViewLink, webContentLink, shared, sharingUser, viewersCanCopyContent",
                 supportsAllDrives=True,
@@ -1538,16 +1579,51 @@ async def get_drive_file_permissions(
         )
 
         # Format the response
+        # Resolve permissions up front: Shared Drive items omit inline permissions
+        # (and the `shared` boolean) on files.get(), so fetch via permissions.list().
+        _perms_for_shared = file_metadata.get("permissions", [])
+        if file_metadata.get("driveId"):
+            _perms_for_shared = await asyncio.to_thread(
+                list_all_permissions, service, file_id
+            )
+        parents = file_metadata.get("parents")
+        parent_str = ", ".join(parents) if parents else "None (root or orphaned)"
+        owners = file_metadata.get("owners") or []
+        if owners:
+            owner_str = ", ".join(
+                (
+                    f"{owner.get('displayName') or owner.get('name') or 'Unknown'} "
+                    f"({owner.get('emailAddress') or owner.get('email')})"
+                )
+                if (owner.get("emailAddress") or owner.get("email"))
+                else owner.get("displayName") or owner.get("name") or "Unknown"
+                for owner in owners
+            )
+        else:
+            owner_str = "None available"
+
         output_parts = [
             f"File: {file_metadata.get('name', 'Unknown')}",
             f"ID: {file_id}",
             f"Type: {file_metadata.get('mimeType', 'Unknown')}",
+            f"Parents: {parent_str}",
+            f"Owners: {owner_str}",
             f"Size: {file_metadata.get('size', 'N/A')} bytes",
+            f"Created: {file_metadata.get('createdTime', 'N/A')}",
             f"Modified: {file_metadata.get('modifiedTime', 'N/A')}",
-            "",
-            "Sharing Status:",
-            f"  Shared: {file_metadata.get('shared', False)}",
+            f"Trashed: {file_metadata.get('trashed', False)}",
         ]
+
+        if file_metadata.get("driveId"):
+            output_parts.append(f"Shared Drive ID: {file_metadata['driveId']}")
+
+        output_parts.extend(
+            [
+                "",
+                "Sharing Status:",
+                f"  Shared: {derive_shared_state(file_metadata, _perms_for_shared)}",
+            ]
+        )
 
         # Add sharing user if available
         sharing_user = file_metadata.get("sharingUser")
@@ -1556,8 +1632,8 @@ async def get_drive_file_permissions(
                 f"  Shared by: {sharing_user.get('displayName', 'Unknown')} ({sharing_user.get('emailAddress', 'Unknown')})"
             )
 
-        # Process permissions
-        permissions = file_metadata.get("permissions", [])
+        # Process permissions (already resolved above as _perms_for_shared)
+        permissions = _perms_for_shared
         if permissions:
             output_parts.append(f"  Number of permissions: {len(permissions)}")
             output_parts.append("  Permissions:")
@@ -1605,7 +1681,15 @@ async def get_drive_file_permissions(
         return f"Error getting file permissions: {e}"
 
 
-@server.tool()
+@server.tool(
+    title="Check Drive File Public Access",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors(
     "check_drive_file_public_access", is_read_only=True, service_type="drive"
 )
@@ -1614,6 +1698,7 @@ async def check_drive_file_public_access(
     service,
     user_google_email: str,
     file_name: str,
+    drive_id: Optional[str] = None,
 ) -> str:
     """
     Searches for a file by name and checks if it has public link sharing enabled.
@@ -1621,23 +1706,34 @@ async def check_drive_file_public_access(
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_name (str): The name of the file to check.
+        drive_id (Optional[str]): ID of the shared drive to scope the search to. When set, the
+                                  underlying files.list call uses corpora='drive' and the given
+                                  driveId, which is required to reliably find files that live only
+                                  in that shared drive. When None, behaviour is unchanged
+                                  (default API corpora applies).
 
     Returns:
         str: Information about the file's sharing status and whether it can be used in Google Docs.
     """
-    logger.info(f"[check_drive_file_public_access] Searching for {file_name}")
+    logger.info(
+        f"[check_drive_file_public_access] Searching for {file_name}"
+        + (f" within drive_id={drive_id}" if drive_id else "")
+    )
 
     # Search for the file
     escaped_name = file_name.replace("'", "\\'")
     query = f"name = '{escaped_name}'"
 
-    list_params = {
+    list_params: Dict[str, Any] = {
         "q": query,
         "pageSize": 10,
         "fields": "files(id, name, mimeType, webViewLink)",
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
     }
+    if drive_id:
+        list_params["corpora"] = "drive"
+        list_params["driveId"] = drive_id
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
 
@@ -1664,13 +1760,17 @@ async def check_drive_file_public_access(
         service.files()
         .get(
             fileId=file_id,
-            fields="id, name, mimeType, permissions, webViewLink, webContentLink, shared",
+            fields="id, name, mimeType, driveId, permissions, webViewLink, webContentLink, shared",
             supportsAllDrives=True,
         )
         .execute
     )
 
     permissions = file_metadata.get("permissions", [])
+    # Shared Drive items do not return inline permissions on files.get(); fall
+    # back to permissions.list() so 'anyone with link' surfaces correctly.
+    if file_metadata.get("driveId"):
+        permissions = await asyncio.to_thread(list_all_permissions, service, file_id)
 
     has_public_link = check_public_link_permission(permissions)
 
@@ -1679,7 +1779,7 @@ async def check_drive_file_public_access(
             f"File: {file_metadata['name']}",
             f"ID: {file_id}",
             f"Type: {file_metadata['mimeType']}",
-            f"Shared: {file_metadata.get('shared', False)}",
+            f"Shared: {derive_shared_state(file_metadata, permissions)}",
             "",
         ]
     )
@@ -1702,10 +1802,17 @@ async def check_drive_file_public_access(
     return "\n".join(output_parts)
 
 
-@server.tool()
+@server.tool(
+    title="Update Drive File",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("update_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
-@restrict_to_drives(target_param="file_id")
 async def update_drive_file(
     service,
     user_google_email: str,
@@ -1725,9 +1832,27 @@ async def update_drive_file(
     copy_requires_writer_permission: Optional[bool] = None,
     # Custom properties
     properties: Optional[dict] = None,  # User-visible custom properties
+    # Content replacement (re-import with format conversion, preserving the file ID)
+    content: Optional[str] = None,  # Text content (markdown, TXT, HTML)
+    file_path: Optional[str] = None,  # Local file path (DOCX, ODT, etc.)
+    file_url: Optional[str] = None,  # Remote URL to fetch content from
+    source_format: Optional[str] = None,  # Format hint (md, docx, txt, html, rtf, odt)
+    mode: str = "replace",  # replace | append | prepend
 ) -> str:
     """
-    Updates metadata and properties of a Google Drive file.
+    Updates metadata, properties, and/or content of a Google Drive file.
+
+    Providing one of ``content``, ``file_path``, or ``file_url`` replaces the file's
+    content in place, preserving the existing file ID, sharing, comments, and links.
+    For native Google Docs/Sheets/Slides the source is uploaded with its source MIME
+    type so the Drive API applies the same format conversion as import_to_google_doc
+    (markdown headings, tables, bold, etc.). For any other file (.md, .txt, .pdf, ...)
+    there is nothing to convert, so the bytes are written back as-is under the file's
+    own MIME type. Metadata and content can be updated in a single call.
+
+    ``mode='append'``/``'prepend'`` splice ``content`` onto the file's existing text
+    server-side, so only the new text has to be supplied — no need to send the whole
+    file back to rewrite it.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1742,11 +1867,35 @@ async def update_drive_file(
         writers_can_share (Optional[bool]): Whether editors can share the file.
         copy_requires_writer_permission (Optional[bool]): Whether copying requires writer permission.
         properties (Optional[dict]): Custom key-value properties for the file.
+        content (Optional[str]): New text content for text-based formats (markdown, TXT, HTML).
+        file_path (Optional[str]): Local file path for binary formats (DOCX, ODT). Supports file:// URLs.
+        file_url (Optional[str]): Remote http(s) URL to fetch new content from.
+        source_format (Optional[str]): Source format hint for conversion
+            (md, markdown, docx, txt, html, rtf, odt). Auto-detected when omitted, and
+            ignored for non-Google files, which are uploaded without conversion.
+            Provide at most one of content/file_path/file_url.
+        mode (str): How to apply the new content — 'replace' (default), 'append', or
+            'prepend'. Append/prepend require 'content' and a UTF-8 text file such as
+            .md or .txt; a newline is inserted at the seam if neither side has one.
+            For native Google Docs use insert_doc_elements, modify_doc_text, or
+            find_and_replace_doc, which edit in place instead of rewriting the file.
 
     Returns:
         str: Confirmation message with details of the updates applied.
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
+
+    if mode not in CONTENT_UPDATE_MODES:
+        raise ValueError(
+            f"Unsupported mode: '{mode}'. Supported: {', '.join(CONTENT_UPDATE_MODES)}."
+        )
+    if mode != "replace" and mime_type is not None:
+        raise ValueError(f"mime_type cannot be set when mode='{mode}'.")
+    if mode != "replace" and content is None:
+        raise ValueError(
+            f"mode='{mode}' requires 'content' (the text to add). "
+            "'file_path' and 'file_url' are only supported with mode='replace'."
+        )
 
     current_file_fields = (
         "name, description, mimeType, parents, starred, trashed, webViewLink, "
@@ -1810,10 +1959,79 @@ async def update_drive_file(
     if update_body:
         query_params["body"] = update_body
 
-    # Perform the update
-    updated_file = await asyncio.to_thread(
-        service.files().update(**query_params).execute
+    # Native Google files take replacement content through Drive's import conversion
+    # (the engine import_to_google_doc uses); any other file has nothing to convert,
+    # so its bytes stream back verbatim under the same file ID.
+    replacing_content = any(x is not None for x in (content, file_path, file_url))
+    remote_file_data = None
+    format_map = None
+    content_update_lock = (
+        _get_content_update_lock(file_id)
+        if replacing_content and mode != "replace"
+        else None
     )
+    if content_update_lock is not None:
+        await content_update_lock.acquire()
+    try:
+        if replacing_content:
+            target_mime_type = mime_type or current_file.get("mimeType") or ""
+            format_map = IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE.get(target_mime_type)
+            if format_map is None and target_mime_type.startswith(
+                GOOGLE_APPS_MIME_PREFIX
+            ):
+                supported_targets = ", ".join(
+                    mime for mime in IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE
+                )
+                raise ValueError(
+                    "Content replacement is not supported for this Google Apps type "
+                    f"({target_mime_type}). Editable Google types: {supported_targets}."
+                )
+
+            if mode != "replace":
+                if format_map is not None:
+                    raise ValueError(
+                        f"mode='{mode}' is only supported for non-Google files, because a "
+                        f"native {target_mime_type} would have to be exported and re-imported "
+                        "to splice text in. Use insert_doc_elements, modify_doc_text, or "
+                        "find_and_replace_doc to edit a Google Doc in place."
+                    )
+                existing_bytes = await _download_file_bytes(service, file_id)
+                try:
+                    existing_text = existing_bytes.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        f"mode='{mode}' requires a UTF-8 text file, but "
+                        f"'{current_file.get('name', file_id)}' ({target_mime_type}) "
+                        "could not be decoded as text."
+                    ) from exc
+                content = _splice_content(existing_text, content, mode)
+
+            media, _source_mime_type, remote_file_data = await _resolve_import_media(
+                tool_name="update_drive_file",
+                file_name=name or current_file.get("name", ""),
+                content=content,
+                file_path=file_path,
+                file_url=file_url,
+                source_format=source_format,
+                format_map=format_map,
+                passthrough_mime_type=(
+                    None
+                    if format_map
+                    else (target_mime_type or "application/octet-stream")
+                ),
+            )
+            query_params["media_body"] = media
+
+        # Perform the update while append/prepend still hold the file lock.
+        updated_file = await asyncio.to_thread(
+            service.files().update(**query_params).execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES if replacing_content else 0,
+        )
+    finally:
+        if remote_file_data is not None:
+            remote_file_data.close()
+        if content_update_lock is not None:
+            content_update_lock.release()
 
     # Build response message
     output_parts = [
@@ -1866,6 +2084,17 @@ async def update_drive_file(
         changes.append(f"   • Copying {copy_status} writer permission")
     if properties:
         changes.append(f"   • Updated custom properties: {properties}")
+    if replacing_content:
+        result_mime_type = updated_file.get(
+            "mimeType", current_file.get("mimeType", "file type")
+        )
+        written_as = "converted to" if format_map else "written as"
+        if mode == "replace":
+            source = "content" if content is not None else (file_path or file_url)
+            detail = f"Replaced content from {source}"
+        else:
+            detail = f"{'Appended' if mode == 'append' else 'Prepended'} text"
+        changes.append(f"   • {detail} ({written_as} {result_mime_type})")
 
     if changes:
         output_parts.append("")
@@ -1880,7 +2109,15 @@ async def update_drive_file(
     return "\n".join(output_parts)
 
 
-@server.tool()
+@server.tool(
+    title="Get Drive Shareable Link",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_drive_shareable_link", is_read_only=True, service_type="drive")
 @require_google_service("drive", "drive_read")
 async def get_drive_shareable_link(
@@ -1940,10 +2177,17 @@ async def get_drive_shareable_link(
     return "\n".join(output_parts)
 
 
-@server.tool()
+@server.tool(
+    title="Manage Drive Access",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("manage_drive_access", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
-@restrict_to_drives(target_param="file_id")
 async def manage_drive_access(
     service,
     user_google_email: str,
@@ -2308,10 +2552,17 @@ async def manage_drive_access(
     return "\n".join(output_parts)
 
 
-@server.tool()
+@server.tool(
+    title="Copy Drive File",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("copy_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
-@restrict_to_drives(target_param="parent_folder_id")
 async def copy_drive_file(
     service,
     user_google_email: str,
@@ -2381,12 +2632,19 @@ async def copy_drive_file(
     return "\n".join(output_parts)
 
 
-@server.tool()
+@server.tool(
+    title="Set Drive File Permissions",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors(
     "set_drive_file_permissions", is_read_only=False, service_type="drive"
 )
 @require_google_service("drive", "drive_file")
-@restrict_to_drives(target_param="file_id")
 async def set_drive_file_permissions(
     service,
     user_google_email: str,

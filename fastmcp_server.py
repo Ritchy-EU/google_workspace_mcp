@@ -14,11 +14,17 @@ dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path=dotenv_path)
 
 from auth.oauth_config import reload_oauth_config, is_stateless_mode
-from core.log_formatter import EnhancedLogFormatter, configure_file_logging
+from core.log_formatter import (
+    EnhancedLogFormatter,
+    configure_file_logging,
+    install_noisy_log_filters,
+)
 from core.utils import check_credentials_directory_permissions
 from core.server import server, set_transport_mode, configure_server_for_http
 from core.tool_registry import (
     set_enabled_tools as set_enabled_tool_names,
+    resolve_disabled_tools,
+    set_disabled_tools,
     wrap_server_tool_method,
     filter_server_tools,
 )
@@ -71,6 +77,8 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+install_noisy_log_filters()
 
 if _fastmcp_cloud_overrides:
     for key, previous, new_value in _fastmcp_cloud_overrides:
@@ -168,6 +176,8 @@ all_services = [
 ]
 set_enabled_tools(all_services)  # Set enabled services for scopes
 set_enabled_tool_names(None)  # Don't filter individual tools - enable all
+# Env-only block list: this entrypoint has no CLI args
+set_disabled_tools(resolve_disabled_tools())
 
 # Filter tools based on configuration
 filter_server_tools(server)

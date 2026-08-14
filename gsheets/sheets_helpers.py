@@ -7,19 +7,30 @@ conditional formatting helpers.
 
 import asyncio
 import json
+import logging
 import re
 from typing import List, Optional, Union
 
 from core.utils import UserInputError
 
+logger = logging.getLogger(__name__)
+
+MAX_GRID_METADATA_CELLS = 5000
+
+# Cap rows fetched by read_sheet_values before calling values().get.
+# Matches the tool default range (A1:Z1000). Open-ended or oversized A1
+# ranges otherwise materialize the full sheet into memory.
+MAX_READ_SHEET_ROWS = 1000
 
 A1_PART_REGEX = re.compile(r"^([A-Za-z]*)(\d*)$")
 SHEET_TITLE_SAFE_RE = re.compile(r"^[A-Za-z0-9_]+$")
+COLUMN_LETTER_REGEX = re.compile(r"^[A-Za-z]+$")
+QUOTED_SHEET_ONLY_REGEX = re.compile(r"^'(?:[^']|'')+'$")
 
 
 def _column_to_index(column: str) -> Optional[int]:
     """Convert column letters (A, B, AA) to zero-based index."""
-    if not column:
+    if not column or not COLUMN_LETTER_REGEX.fullmatch(column):
         return None
     result = 0
     for char in column.upper():
@@ -35,7 +46,7 @@ def _parse_a1_part(
     Supports anchors like '$A$1' by stripping the dollar signs.
     """
     clean_part = part.replace("$", "")
-    match = pattern.match(clean_part)
+    match = pattern.fullmatch(clean_part)
     if not match:
         raise UserInputError(f"Invalid A1 range part: '{part}'.")
     col_letters, row_digits = match.groups()
@@ -65,6 +76,100 @@ def _split_sheet_and_range(range_name: str) -> tuple[Optional[str], str]:
 
     sheet_name, a1_range = range_name.split("!", 1)
     return sheet_name.strip().strip("'"), a1_range
+
+
+def _format_a1_part(col_idx: Optional[int], row_idx: Optional[int]) -> str:
+    """Build an A1 cell/partial reference from zero-based indexes."""
+    col = _index_to_column(col_idx) if col_idx is not None else ""
+    row = str(row_idx + 1) if row_idx is not None else ""
+    if not col and not row:
+        raise UserInputError("A1 range part must include a column and/or row.")
+    return f"{col}{row}"
+
+
+def _format_read_clamp_note(range_name: str, clamped_range: str, max_rows: int) -> str:
+    """Describe a rewritten read range and how to continue paging."""
+    return (
+        f"\n\nNote: Requested range '{range_name}' was clamped to '{clamped_range}' "
+        f"(max {max_rows} rows per read). Request a later row window to continue."
+    )
+
+
+def _clamp_a1_read_rows(
+    range_name: str, max_rows: int = MAX_READ_SHEET_ROWS
+) -> tuple[str, Optional[str]]:
+    """
+    Rewrite an A1 range so it spans at most ``max_rows`` rows.
+
+    Open-ended ranges (e.g. ``A:Z``, ``Sheet1!A1:Z``) and quoted whole-sheet
+    references (e.g. ``'My Sheet'``) are closed to a finite end row. Oversized
+    finite ranges are truncated from the start row. Bare identifiers are
+    returned unchanged because they can refer to named ranges.
+
+    Returns:
+        (range_for_api, note): ``note`` is set when the range was rewritten.
+    """
+    if max_rows < 1:
+        raise ValueError(f"max_rows must be >= 1, got {max_rows}")
+
+    # A quoted sheet title without coordinates unambiguously addresses the
+    # entire sheet. Bare identifiers are intentionally not handled here:
+    # Google Sheets resolves them as named ranges when a matching name exists.
+    if QUOTED_SHEET_ONLY_REGEX.fullmatch(range_name):
+        clamped_range = f"{range_name}!1:{max_rows}"
+        return clamped_range, _format_read_clamp_note(
+            range_name, clamped_range, max_rows
+        )
+
+    sheet_name, a1_range = _split_sheet_and_range(range_name)
+    if not a1_range:
+        return range_name, None
+
+    try:
+        if ":" in a1_range:
+            start, end = a1_range.split(":", 1)
+        else:
+            # Bare identifiers without a row (e.g. named ranges) are not A1
+            # coordinates we can safely rewrite.
+            start = end = a1_range
+        start_col, start_row = _parse_a1_part(start)
+        end_col, end_row = _parse_a1_part(end)
+    except UserInputError:
+        logger.warning(
+            "Cannot clamp non-A1 sheet range %r; fetching as requested",
+            range_name,
+        )
+        return range_name, None
+
+    if ":" not in a1_range and start_row is None:
+        return range_name, None
+
+    effective_start = start_row if start_row is not None else 0
+    max_end_row = effective_start + max_rows - 1
+
+    clamped = False
+    if start_row is None:
+        start_row = effective_start
+        clamped = True
+    if end_row is None or end_row > max_end_row:
+        end_row = max_end_row
+        clamped = True
+
+    if not clamped:
+        return range_name, None
+
+    range_ref = (
+        _format_a1_part(start_col, start_row)
+        if start_col == end_col and start_row == end_row
+        else f"{_format_a1_part(start_col, start_row)}:{_format_a1_part(end_col, end_row)}"
+    )
+    if sheet_name is not None:
+        clamped_range = f"{_quote_sheet_title_for_a1(sheet_name)}!{range_ref}"
+    else:
+        clamped_range = range_ref
+
+    note = _format_read_clamp_note(range_name, clamped_range, max_rows)
+    return clamped_range, note
 
 
 def _parse_a1_range(range_name: str, sheets: List[dict]) -> dict:
@@ -168,7 +273,7 @@ def _quote_sheet_title_for_a1(sheet_title: str) -> str:
     If the sheet title contains special characters or spaces, it is wrapped in single quotes.
     Any single quotes in the title are escaped by doubling them, as required by Google Sheets.
     """
-    if SHEET_TITLE_SAFE_RE.match(sheet_title or ""):
+    if SHEET_TITLE_SAFE_RE.fullmatch(sheet_title or ""):
         return sheet_title
     escaped = (sheet_title or "").replace("'", "''")
     return f"'{escaped}'"
@@ -877,3 +982,248 @@ def _build_gradient_rule(
         rule_body["gradientRule"]["midpoint"] = gradient_points[1]
         rule_body["gradientRule"]["maxpoint"] = gradient_points[2]
     return rule_body
+
+
+def _extract_cell_notes_from_grid(spreadsheet: dict) -> list[dict[str, str]]:
+    """
+    Extract cell notes from spreadsheet grid data.
+
+    Returns a list of dictionaries with:
+        - "cell": cell A1 reference
+        - "note": the note text
+    """
+    notes: list[dict[str, str]] = []
+    for sheet in spreadsheet.get("sheets", []) or []:
+        sheet_title = sheet.get("properties", {}).get("title") or "Unknown"
+        for grid in sheet.get("data", []) or []:
+            start_row = _coerce_int(grid.get("startRow"), default=0)
+            start_col = _coerce_int(grid.get("startColumn"), default=0)
+            for row_offset, row_data in enumerate(grid.get("rowData", []) or []):
+                if not row_data:
+                    continue
+                for col_offset, cell_data in enumerate(
+                    row_data.get("values", []) or []
+                ):
+                    if not cell_data:
+                        continue
+                    note = cell_data.get("note")
+                    if not note:
+                        continue
+                    notes.append(
+                        {
+                            "cell": _format_a1_cell(
+                                sheet_title,
+                                start_row + row_offset,
+                                start_col + col_offset,
+                            ),
+                            "note": note,
+                        }
+                    )
+    return notes
+
+
+async def _fetch_sheet_notes(
+    service, spreadsheet_id: str, a1_range: str
+) -> list[dict[str, str]]:
+    """Fetch cell notes for the given range via spreadsheets.get with includeGridData."""
+    response = await asyncio.to_thread(
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            ranges=[a1_range],
+            includeGridData=True,
+            fields="sheets(properties(title),data(startRow,startColumn,rowData(values(note))))",
+        )
+        .execute
+    )
+    return _extract_cell_notes_from_grid(response)
+
+
+def _format_sheet_notes_section(
+    *, notes: list[dict[str, str]], range_label: str, max_details: int = 25
+) -> str:
+    """
+    Format a list of cell notes into a human-readable section.
+    """
+    if not notes:
+        return ""
+
+    lines = []
+    for item in notes[:max_details]:
+        cell = item.get("cell") or "(unknown cell)"
+        note = item.get("note") or "(empty note)"
+        lines.append(f"- {cell}: {note}")
+
+    suffix = (
+        f"\n... and {len(notes) - max_details} more notes"
+        if len(notes) > max_details
+        else ""
+    )
+    return f"\n\nCell notes in range '{range_label}':\n" + "\n".join(lines) + suffix
+
+
+async def _fetch_cell_formulas(
+    service,
+    spreadsheet_id: str,
+    resolved_range: str,
+) -> tuple[str, List[List[object]]]:
+    """Fetch formula strings for cells in the given range.
+
+    Makes a second values().get() call with valueRenderOption="FORMULA" and
+    returns a formatted section listing any cells whose value starts with "=".
+    Cells containing plain values are silently skipped.
+
+    Returns an empty section and empty values list if the request fails.
+    """
+    try:
+        result = await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                range=resolved_range,
+                valueRenderOption="FORMULA",
+            )
+            .execute
+        )
+    except Exception as exc:
+        logger.warning(
+            "[read_sheet_values] Failed fetching formula values for range '%s': %s",
+            resolved_range,
+            exc,
+        )
+        return "", []
+
+    formula_values = result.get("values", [])
+    formulas: list[dict[str, str]] = []
+
+    sheet_name, range_part = _split_sheet_and_range(resolved_range)
+    start_part = range_part.split(":")[0] if ":" in range_part else range_part
+    start_col_idx, start_row_idx = _parse_a1_part(start_part)
+    base_col = start_col_idx if start_col_idx is not None else 0
+    base_row = start_row_idx if start_row_idx is not None else 0
+
+    for row_offset, formula_row in enumerate(formula_values):
+        for col_offset, cell_value in enumerate(formula_row):
+            if isinstance(cell_value, str) and cell_value.startswith("="):
+                abs_col = base_col + col_offset
+                abs_row = base_row + row_offset
+                cell_ref = f"{_index_to_column(abs_col)}{abs_row + 1}"
+                if sheet_name:
+                    cell_ref = f"{_quote_sheet_title_for_a1(sheet_name)}!{cell_ref}"
+                formulas.append({"cell": cell_ref, "formula": cell_value})
+
+    return (
+        _format_sheet_formula_section(formulas=formulas, range_label=resolved_range),
+        formula_values,
+    )
+
+
+def _format_sheet_formula_section(
+    *, formulas: list[dict[str, str]], range_label: str, max_details: int = 50
+) -> str:
+    """Format a list of formula cells into a human-readable section."""
+    if not formulas:
+        return ""
+
+    lines = []
+    for item in formulas[:max_details]:
+        cell = item.get("cell") or "(unknown cell)"
+        formula = item.get("formula") or "(empty formula)"
+        lines.append(f"- {cell}: {formula}")
+
+    suffix = (
+        f"\n... and {len(formulas) - max_details} more formula cells"
+        if len(formulas) > max_details
+        else ""
+    )
+    return f"\n\nFormula cells in range '{range_label}':\n" + "\n".join(lines) + suffix
+
+
+async def _fetch_grid_metadata(
+    service,
+    spreadsheet_id: str,
+    resolved_range: str,
+    values: List[List[object]],
+    include_hyperlinks: bool = False,
+    include_notes: bool = False,
+) -> tuple[str, str]:
+    """Fetch hyperlinks and/or notes for a range via a single spreadsheets.get call.
+
+    Computes tight range bounds, enforces the cell-count cap, builds a combined
+    ``fields`` selector so only one API round-trip is needed when both flags are
+    ``True``, then parses the response into formatted output sections.
+
+    Returns:
+        (hyperlink_section, notes_section) — each is an empty string when the
+        corresponding flag is ``False`` or no data was found.
+    """
+    if not include_hyperlinks and not include_notes:
+        return "", ""
+
+    tight_range = _a1_range_for_values(resolved_range, values)
+    if not tight_range:
+        logger.info(
+            "[read_sheet_values] Skipping grid metadata fetch for range '%s': "
+            "unable to determine tight bounds",
+            resolved_range,
+        )
+        return "", ""
+
+    cell_count = _a1_range_cell_count(tight_range) or sum(len(row) for row in values)
+    if cell_count > MAX_GRID_METADATA_CELLS:
+        logger.info(
+            "[read_sheet_values] Skipping grid metadata fetch for large range "
+            "'%s' (%d cells > %d limit)",
+            tight_range,
+            cell_count,
+            MAX_GRID_METADATA_CELLS,
+        )
+        return "", ""
+
+    # Build a combined fields selector so we hit the API at most once.
+    value_fields: list[str] = []
+    if include_hyperlinks:
+        value_fields.extend(["hyperlink", "textFormatRuns(format(link(uri)))"])
+    if include_notes:
+        value_fields.append("note")
+
+    fields = (
+        "sheets(properties(title),data(startRow,startColumn,"
+        f"rowData(values({','.join(value_fields)}))))"
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                ranges=[tight_range],
+                includeGridData=True,
+                fields=fields,
+            )
+            .execute
+        )
+    except Exception as exc:
+        logger.warning(
+            "[read_sheet_values] Failed fetching grid metadata for range '%s': %s",
+            tight_range,
+            exc,
+        )
+        return "", ""
+
+    hyperlink_section = ""
+    if include_hyperlinks:
+        hyperlinks = _extract_cell_hyperlinks_from_grid(response)
+        hyperlink_section = _format_sheet_hyperlink_section(
+            hyperlinks=hyperlinks, range_label=tight_range
+        )
+
+    notes_section = ""
+    if include_notes:
+        notes = _extract_cell_notes_from_grid(response)
+        notes_section = _format_sheet_notes_section(
+            notes=notes, range_label=tight_range
+        )
+
+    return hyperlink_section, notes_section

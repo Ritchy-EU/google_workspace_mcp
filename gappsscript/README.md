@@ -154,6 +154,8 @@ https://www.googleapis.com/auth/script.deployments
 https://www.googleapis.com/auth/script.deployments.readonly
 https://www.googleapis.com/auth/script.processes
 https://www.googleapis.com/auth/script.metrics
+https://www.googleapis.com/auth/script.external_request
+https://www.googleapis.com/auth/script.scriptapp
 https://www.googleapis.com/auth/drive.file
 ```
 
@@ -184,7 +186,7 @@ Essential operations for reading, writing, and executing scripts:
 - `get_script_project`: Get full project with all files
 - `get_script_content`: Get specific file content
 - `create_script_project`: Create new project
-- `update_script_content`: Modify project files
+- `update_script_content`: Merge or replace project files (`merge=true` by default)
 - `run_script_function`: Execute functions
 - `generate_trigger_code`: Generate trigger setup code
 
@@ -269,7 +271,9 @@ Files:
 The AI will:
 1. Read current code
 2. Generate improved version
-3. Call `update_script_content` with new files
+3. Call `update_script_content` with the changed files (`merge=true` merges by file name)
+
+To delete files or replace the entire project, pass `merge=false` with the complete desired file set.
 
 ### Run Script Function
 
