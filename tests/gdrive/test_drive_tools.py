@@ -171,6 +171,53 @@ async def test_create_drive_file_rejects_empty_file_url():
     mock_service.files.return_value.create.return_value.execute.assert_not_called()
 
 
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+async def test_create_drive_file_creates_empty_google_native_file(mock_resolve_folder):
+    """Google-native MIME types are created empty (metadata only, no media_body)."""
+    mock_resolve_folder.return_value = "folder123"
+    mock_service = Mock()
+    mock_service.files().create().execute.return_value = {
+        "id": "doc123",
+        "name": "Empty Doc",
+        "webViewLink": "https://docs.google.com/document/d/doc123",
+    }
+
+    result = await _unwrap(create_drive_file)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        file_name="Empty Doc",
+        folder_id="target-folder",
+        mime_type="application/vnd.google-apps.document",
+    )
+
+    create_kwargs = mock_service.files.return_value.create.call_args.kwargs
+    assert create_kwargs["body"] == {
+        "name": "Empty Doc",
+        "parents": ["folder123"],
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    assert create_kwargs["supportsAllDrives"] is True
+    assert "media_body" not in create_kwargs
+    assert "Successfully created file 'Empty Doc'" in result
+
+
+@pytest.mark.asyncio
+async def test_create_drive_file_still_requires_content_for_regular_mime():
+    """Non-Google-native MIME types still require a content source."""
+    mock_service = Mock()
+
+    with pytest.raises(ValueError, match="content"):
+        await _unwrap(create_drive_file)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            file_name="report.pdf",
+            mime_type="application/pdf",
+        )
+
+    mock_service.files.return_value.create.return_value.execute.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # get_drive_file_permissions — owners
 # ---------------------------------------------------------------------------
