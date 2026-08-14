@@ -9,9 +9,46 @@ Supports both OAuth 2.0 and OAuth 2.1 with automatic client capability detection
 """
 
 import os
+from ipaddress import ip_address
 from threading import RLock
 from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
+
+
+_ASYMMETRIC_JWT_ALGORITHM_FAMILIES = {
+    "ES": frozenset({"ES256", "ES256K", "ES384", "ES512", "ES521"}),
+    "EdDSA": frozenset({"EdDSA"}),
+    "PS": frozenset({"PS256", "PS384", "PS512"}),
+    "RS": frozenset({"RS256", "RS384", "RS512"}),
+}
+
+
+def _is_loopback_host(hostname: Optional[str]) -> bool:
+    """Return whether a JWKS hostname is explicitly local-only."""
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_secure_gateway_jwks_url(url: str) -> bool:
+    """Require HTTPS except for explicit HTTP loopback development endpoints."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    return bool(
+        hostname
+        and (
+            parsed.scheme == "https"
+            or (parsed.scheme == "http" and _is_loopback_host(hostname))
+        )
+    )
 
 
 class OAuthConfig:
@@ -26,7 +63,10 @@ class OAuthConfig:
     def __init__(self):
         # Base server configuration
         self.base_uri = os.getenv("WORKSPACE_MCP_BASE_URI", "http://localhost")
-        self.port = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", "8000")))
+        if os.getenv("WORKSPACE_MCP_RESOLVED_PORT") == "1":
+            self.port = int(os.getenv("WORKSPACE_MCP_PORT", os.getenv("PORT", "8000")))
+        else:
+            self.port = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", "8000")))
         self.base_url = f"{self.base_uri}:{self.port}"
 
         # External URL for reverse proxy scenarios
@@ -35,6 +75,13 @@ class OAuthConfig:
         # OAuth client configuration
         self.client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
         self.client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+
+        # Branding for the OAuth consent page. FastMCP's OAuth proxy renders the
+        # server's name / icon / website on the consent screen; these env vars feed
+        # those server fields. All optional — unset leaves the upstream defaults.
+        self.brand_name = os.getenv("WORKSPACE_MCP_BRAND_NAME")
+        self.brand_icon_url = os.getenv("WORKSPACE_MCP_BRAND_ICON_URL")
+        self.brand_website_url = os.getenv("WORKSPACE_MCP_BRAND_WEBSITE_URL")
 
         # OAuth 2.1 configuration
         self.oauth21_enabled = (
@@ -54,6 +101,103 @@ class OAuthConfig:
                 "EXTERNAL_OAUTH21_PROVIDER requires MCP_ENABLE_OAUTH21=true"
             )
 
+        # Trusted-gateway identity (provider-agnostic).
+        # An MCP-aware reverse proxy (e.g. Pomerium, oauth2-proxy, Cloudflare Access,
+        # Istio/Envoy, Traefik ForwardAuth) authenticates the user and injects a SIGNED
+        # identity assertion (a JWT) on every upstream request. This server verifies that
+        # assertion against the proxy's JWKS and uses the asserted email as the per-request
+        # principal — WITHOUT terminating MCP OAuth itself (MCP_ENABLE_OAUTH21 stays off), so
+        # it composes with the proxy instead of fighting it for the single MCP auth handshake.
+        # Credentials are still the legacy per-user Google grants (keyed by email); the asserted
+        # identity just selects/locks which user's grant a request may use (true per-user isolation).
+        # Defaults target Pomerium; override the header/algorithm for other providers.
+        self.trust_gateway_identity = (
+            os.getenv("TRUST_GATEWAY_IDENTITY", "false").lower() == "true"
+        )
+        self.gateway_identity_jwks_url = (
+            os.getenv("GATEWAY_IDENTITY_JWKS_URL", "").strip() or None
+        )
+        # Header carrying the signed assertion (default: Pomerium's x-pomerium-jwt-assertion;
+        # e.g. cf-access-jwt-assertion for Cloudflare Access).
+        self.gateway_identity_header = (
+            os.getenv("GATEWAY_IDENTITY_HEADER", "x-pomerium-jwt-assertion")
+            .strip()
+            .lower()
+        )
+        # Allowed signing algorithm(s), comma-separated (default ES256 — Pomerium; use
+        # RS256 for Cloudflare Access, etc.). Pinned to block alg-confusion/none attacks.
+        self.gateway_identity_algorithms = [
+            a.strip()
+            for a in os.getenv("GATEWAY_IDENTITY_ALGORITHMS", "ES256").split(",")
+            if a.strip()
+        ]
+        # Audience binds assertions to this relying party and is mandatory. Issuer
+        # pinning remains optional for gateways whose JWKS URL is the trust boundary.
+        self.gateway_identity_issuer = (
+            os.getenv("GATEWAY_IDENTITY_ISSUER", "").strip() or None
+        )
+        self.gateway_identity_audience = (
+            os.getenv("GATEWAY_IDENTITY_AUDIENCE", "").strip() or None
+        )
+        if self.trust_gateway_identity:
+            if self.oauth21_enabled:
+                raise ValueError(
+                    "TRUST_GATEWAY_IDENTITY is incompatible with MCP_ENABLE_OAUTH21=true. "
+                    "In trusted-gateway mode the proxy owns the MCP handshake; keep "
+                    "MCP_ENABLE_OAUTH21=false."
+                )
+            if not self.gateway_identity_jwks_url:
+                raise ValueError(
+                    "TRUST_GATEWAY_IDENTITY=true requires GATEWAY_IDENTITY_JWKS_URL "
+                    "(the gateway's JWKS endpoint used to verify the identity assertion)."
+                )
+            if not _is_secure_gateway_jwks_url(self.gateway_identity_jwks_url):
+                raise ValueError(
+                    "GATEWAY_IDENTITY_JWKS_URL must use HTTPS; HTTP is permitted "
+                    "only for loopback development endpoints."
+                )
+            if not self.gateway_identity_algorithms:
+                raise ValueError(
+                    "TRUST_GATEWAY_IDENTITY=true requires GATEWAY_IDENTITY_ALGORITHMS "
+                    "to list at least one signing algorithm (e.g. ES256)."
+                )
+            algorithm_families = {
+                family
+                for family, algorithms in _ASYMMETRIC_JWT_ALGORITHM_FAMILIES.items()
+                if any(
+                    algorithm in algorithms
+                    for algorithm in self.gateway_identity_algorithms
+                )
+            }
+            allowed_algorithms = set().union(
+                *_ASYMMETRIC_JWT_ALGORITHM_FAMILIES.values()
+            )
+            invalid_algorithms = [
+                algorithm
+                for algorithm in self.gateway_identity_algorithms
+                if algorithm not in allowed_algorithms
+            ]
+            if invalid_algorithms:
+                raise ValueError(
+                    "GATEWAY_IDENTITY_ALGORITHMS must contain only supported "
+                    "asymmetric JWT algorithms."
+                )
+            if len(algorithm_families) != 1:
+                raise ValueError(
+                    "GATEWAY_IDENTITY_ALGORITHMS must use a single asymmetric "
+                    "JWT algorithm family."
+                )
+            if not self.gateway_identity_header:
+                raise ValueError(
+                    "TRUST_GATEWAY_IDENTITY=true requires a non-empty "
+                    "GATEWAY_IDENTITY_HEADER."
+                )
+            if not self.gateway_identity_audience:
+                raise ValueError(
+                    "TRUST_GATEWAY_IDENTITY=true requires GATEWAY_IDENTITY_AUDIENCE "
+                    "(the audience that identifies this MCP deployment)."
+                )
+
         # Stateless mode configuration
         self.stateless_mode = (
             os.getenv("WORKSPACE_MCP_STATELESS_MODE", "false").lower() == "true"
@@ -63,6 +207,32 @@ class OAuthConfig:
                 "WORKSPACE_MCP_STATELESS_MODE requires MCP_ENABLE_OAUTH21=true"
             )
 
+        # Service account (domain-wide delegation) configuration
+        self.service_account_key_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY_FILE")
+        self.service_account_key_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY_JSON")
+        if self.service_account_key_file and self.service_account_key_json:
+            raise ValueError(
+                "Only one service account key source may be provided. "
+                "Set either GOOGLE_SERVICE_ACCOUNT_KEY_FILE or "
+                "GOOGLE_SERVICE_ACCOUNT_KEY_JSON, not both."
+            )
+        self.service_account_enabled = bool(
+            self.service_account_key_file or self.service_account_key_json
+        )
+        if self.service_account_enabled and self.oauth21_enabled:
+            raise ValueError(
+                "Service account mode is incompatible with OAuth 2.1 mode. "
+                "Set GOOGLE_SERVICE_ACCOUNT_KEY_FILE or GOOGLE_SERVICE_ACCOUNT_KEY_JSON, "
+                "but not MCP_ENABLE_OAUTH21=true."
+            )
+
+        # Optional per-request impersonation domain allowlist for service accounts.
+        _raw_domains = os.getenv("DWD_ALLOWED_DOMAINS", "")
+        self.dwd_allowed_domains: List[str] = (
+            [d.strip().lower() for d in _raw_domains.split(",") if d.strip()]
+            if self.service_account_enabled and _raw_domains
+            else []
+        )
         # Transport mode (will be set at runtime)
         self._transport_mode = "stdio"  # Default
 
@@ -116,9 +286,16 @@ class OAuthConfig:
             )
 
         _set_if_absent("FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_ID", self.client_id)
-        _set_if_absent("FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_SECRET", self.client_secret)
+        if self.client_secret:
+            _set_if_absent(
+                "FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_SECRET", self.client_secret
+            )
         _set_if_absent("FASTMCP_SERVER_AUTH_GOOGLE_BASE_URL", self.get_oauth_base_url())
         _set_if_absent("FASTMCP_SERVER_AUTH_GOOGLE_REDIRECT_PATH", self.redirect_path)
+
+    def is_public_client(self) -> bool:
+        """Return True when only a client_id is configured (no client_secret)."""
+        return bool(self.client_id and not self.client_secret)
 
     def get_redirect_uris(self) -> List[str]:
         """
@@ -175,7 +352,7 @@ class OAuthConfig:
         Returns:
             True if OAuth client credentials are available
         """
-        return bool(self.client_id and self.client_secret)
+        return bool(self.client_id)
 
     def get_oauth_base_url(self) -> str:
         """
@@ -218,9 +395,12 @@ class OAuthConfig:
             "redirect_uri": self.redirect_uri,
             "redirect_path": self.redirect_path,
             "client_configured": bool(self.client_id),
+            "client_secret_configured": bool(self.client_secret),
+            "public_client": self.is_public_client(),
             "oauth21_enabled": self.oauth21_enabled,
             "external_oauth21_provider": self.external_oauth21_provider,
             "pkce_required": self.pkce_required,
+            "service_account_enabled": self.service_account_enabled,
             "transport_mode": self._transport_mode,
             "total_redirect_uris": len(self.get_redirect_uris()),
             "total_allowed_origins": len(self.get_allowed_origins()),
@@ -264,6 +444,15 @@ class OAuthConfig:
             True if external OAuth 2.1 provider is enabled
         """
         return self.external_oauth21_provider
+
+    def is_service_account_enabled(self) -> bool:
+        """
+        Check if service account (domain-wide delegation) mode is enabled.
+
+        Returns:
+            True if service account mode is enabled
+        """
+        return self.service_account_enabled
 
     def detect_oauth_version(self, request_params: Dict[str, Any]) -> str:
         """
@@ -335,10 +524,11 @@ class OAuthConfig:
             "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
             "response_types_supported": ["code", "token"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_post",
-                "client_secret_basic",
-            ],
+            "token_endpoint_auth_methods_supported": (
+                ["none"]
+                if self.is_public_client()
+                else ["client_secret_post", "client_secret_basic"]
+            ),
             "code_challenge_methods_supported": self.supported_code_challenge_methods,
         }
 
@@ -442,3 +632,13 @@ def is_stateless_mode() -> bool:
 def is_external_oauth21_provider() -> bool:
     """Check if external OAuth 2.1 provider mode is enabled."""
     return get_oauth_config().is_external_oauth21_provider()
+
+
+def is_trust_gateway_identity() -> bool:
+    """Check if trusted-gateway identity (signed assertion) mode is enabled."""
+    return get_oauth_config().trust_gateway_identity
+
+
+def is_service_account_enabled() -> bool:
+    """Check if service account (domain-wide delegation) mode is enabled."""
+    return get_oauth_config().is_service_account_enabled()
